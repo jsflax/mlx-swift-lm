@@ -409,6 +409,20 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
     }
 
+    /// Pipeline-parallel send tie: make this cache's `keys` depend on `token`.
+    ///
+    /// In the pipeline forward a non-last stage does `send(h, to: rank-1)` and the
+    /// returned dependency token must be sequenced *after* this layer's in-place KV
+    /// write, or MLX's lazy graph may reorder/prune the cross-machine send relative
+    /// to the cache update (Python: `cache[-1].keys = mx.depends(cache[-1].keys, h)`,
+    /// glm_dist/patch.py:56-57). `keys` is `internal` with no public setter, hence
+    /// this dedicated accessor. No-op before the first `update`.
+    public func tieKeys(dependingOn token: MLXArray) {
+        if let keys = self.keys {
+            self.keys = depends(input: keys, dependencies: [token])
+        }
+    }
+
     public override var isTrimmable: Bool { true }
 
     @discardableResult

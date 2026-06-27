@@ -16,6 +16,16 @@ public func loadWeights(
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
 ) throws {
+    // Pipeline-parallel hook: if a caller set up a ring and this model can shard, load only
+    // this rank's shard (and warm it up) instead of the whole model. See `PipelineLoad`.
+    if let cfg = PipelineLoad.active, model is PipelineParallel {
+        try loadWeightsDistributed(
+            modelDirectory: modelDirectory, model: model, group: cfg.group,
+            boundary: cfg.boundary, quantization: quantization,
+            perLayerQuantization: perLayerQuantization)
+        return
+    }
+
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
