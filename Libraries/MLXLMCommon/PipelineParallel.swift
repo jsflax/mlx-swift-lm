@@ -45,6 +45,12 @@ public protocol PipelineParallel: AnyObject {
     /// the weights are loaded + quantized. NOT the distributed forward (that would block
     /// on the peer's collective).
     func warmup()
+
+    /// The active pipeline ring group when this model is sharded across ≥2 machines, else nil.
+    /// The decode loop uses it to broadcast the per-step sampled token from rank 0 to every rank
+    /// (so a sampling — temp>0 — turn stays in lockstep despite per-rank RNG; for greedy it's a
+    /// no-op since the all-gathered logits are already identical).
+    var ringGroup: DistributedGroup? { get }
 }
 
 /// Process-global hook so the standard factory weight-load (``loadWeights``) transparently

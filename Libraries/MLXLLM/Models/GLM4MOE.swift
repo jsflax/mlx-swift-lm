@@ -571,6 +571,11 @@ extension GLM4MoEModel: PipelineParallel {
         }
     }
 
+    public var ringGroup: DistributedGroup? {
+        guard let g = model.pipelineGroup, g.size > 1 else { return nil }
+        return g
+    }
+
     public func warmup() {
         // LOCAL forward (no collectives) through this rank's own layers, per-layer eval, to
         // fault the resident shard + compile kernels — the GPU-watchdog fix (run.py:51-57).
