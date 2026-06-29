@@ -160,7 +160,10 @@ public func loadWeightsDistributed(
     eval(model)
 
     // 8. Warmup forward — faults the resident shard + compiles kernels (the watchdog fix).
+    let distDbg = ProcessInfo.processInfo.environment["SWIFTLM_DIST_DEBUG"] != nil
+    if distDbg { FileHandle.standardError.write(Data("[dist-load r\(group.rank)] warmup forward START (faulting shard) …\n".utf8)) }
     pp.warmup()
+    if distDbg { FileHandle.standardError.write(Data("[dist-load r\(group.rank)] warmup forward DONE\n".utf8)) }
 
     // 9. Post-warmup barrier (Track A run.py:67): every rank waits HERE on the CPU stream (no GPU
     //    watchdog) until ALL ranks finish load+warmup. Without it the lighter-sharded rank (fewer

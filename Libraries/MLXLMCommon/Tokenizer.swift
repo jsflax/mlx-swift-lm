@@ -103,7 +103,14 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
             return nil
         }
 
-        if new.hasSuffix("\n") {
+        // Reset the decode window at safe boundaries so `decode(segmentTokens)` stays O(1) amortized
+        // instead of re-decoding an unbounded segment EVERY token — an O(n^2) host cost that dominates
+        // long, newline-sparse generations (e.g. GLM <think> reasoning: ~0.45 ms/token-in-segment grows
+        // to >100 ms/token by token 256, halving end-to-end tok/s vs the model's true rate). We only reach
+        // here after a COMPLETE unicode char was emitted (the replacement-char guard above returns early),
+        // so capping the window can never split a multi-byte char. 16 is well past any valid UTF-8 char
+        // (≤4 bytes) yet keeps the per-token decode bounded. Output is byte-identical to the uncapped path.
+        if new.hasSuffix("\n") || segmentTokens.count >= 16 {
             startNewSegment()
         } else {
             self.segment = newSegment

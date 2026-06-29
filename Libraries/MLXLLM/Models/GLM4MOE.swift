@@ -107,7 +107,8 @@ class GLM4MoEMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        // Fused silu(gate)*up (mirrors Python's @mx.compile swiglu) — one cached graph vs 2 eager ops/layer.
+        downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -122,6 +123,15 @@ class GLM4MoEGate: Module {
 
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
+
+    /// Compiled expert-router selection tail. Mirrors Python's `@mx.compile group_expert_select`
+    /// (mlx_lm/models/glm4_moe.py:131) — the ONLY compiled region in the GLM decode path. Collapses
+    /// the ~18 eager router ops (sigmoid/+bias/group-route/argPartition/takeAlong/normalize/scale)
+    /// into ONE cached graph replayed per token. Without this, rank 0's ~60 MoE layers re-encode
+    /// ~1,080 tiny host ops every token — the dominant host-side cost that starves the GPU between
+    /// kernels (measured ~3x slower than Python before this). The `x @ weight.T` matmul stays OUTSIDE
+    /// (passed in as `hidden`), exactly like Python.
+    private let selectExperts: @Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray)
 
     init(_ config: GLM4MoEConfiguration) {
         guard let nRoutedExperts = config.nRoutedExperts else {
@@ -141,42 +151,44 @@ class GLM4MoEGate: Module {
         _weight.wrappedValue = zeros([nRoutedExperts, config.hiddenSize])
         _eScoreCorrectionBias.wrappedValue = zeros([nRoutedExperts])
 
+        // Bake the scalar config in as constants (like Python bakes its int args into the @mx.compile
+        // trace); the closure is then pure over (hidden, bias) and traced once, replayed thereafter.
+        let topK = config.numExpertsPerTok
+        let nGroup = config.nGroup
+        let topkGroup = config.topkGroup
+        let rsf = config.routedScalingFactor
+        let normTopk = config.normTopkProb
+        let sigmoidScoring = config.scoringFunc == "sigmoid"
+        // NOT shapeless: the expert-axis slices (argPartition[..<topK], group-route [..<kk]) can't infer
+        // output shapes under shapeless. Python's @mx.compile is shape-specialized too — it traces the
+        // handful of decode/prefill shapes once, then replays.
+        self.selectExperts = compile { (hidden: MLXArray, bias: MLXArray) in
+            let scores =
+                sigmoidScoring
+                ? sigmoid(hidden.asType(.float32))
+                : softmax(hidden.asType(.float32), axis: -1)
+            var sel = scores + bias
+            if nGroup > 1 {
+                sel = unflatten(sel, axis: -1, shape: [nGroup, -1])
+                let gs = top(sel, k: 2, axis: -1).sum(axis: -1, keepDims: true)
+                let kk = nGroup - topkGroup
+                let gIdx = argPartition(gs, kth: kk - 1, axis: -2)[.ellipsis, ..<kk, 0...]
+                sel = putAlong(sel, stopGradient(gIdx), values: MLXArray(0.0), axis: -2)
+                sel = flattened(sel, start: -2, end: -1)
+            }
+            let inds = argPartition(-sel, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+            var sc = takeAlong(scores, inds, axis: -1)
+            if topK > 1, normTopk {
+                sc = sc / sc.sum(axis: -1, keepDims: true)
+            }
+            return (inds, sc * rsf)
+        }
+
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let hiddenStates = x.matmul(weight.T)
-        var scores: MLXArray
-        if scoringFunc == "sigmoid" {
-            scores = sigmoid(hiddenStates.asType(.float32))
-        } else {
-            scores = softmax(hiddenStates.asType(.float32), axis: -1)
-        }
-
-        let originalScores = scores
-        var selectionScores = scores + eScoreCorrectionBias
-
-        if nGroup > 1 {
-            selectionScores = unflatten(selectionScores, axis: -1, shape: [nGroup, -1])
-            let groupScores = top(selectionScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
-            let k = nGroup - topkGroup
-            let groupIdx = argPartition(groupScores, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
-            selectionScores = putAlong(
-                selectionScores, stopGradient(groupIdx), values: MLXArray(0.0), axis: -2)
-            selectionScores = flattened(selectionScores, start: -2, end: -1)
-        }
-
-        let k = topK
-        let inds = argPartition(-selectionScores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
-        var selectedScores = takeAlong(originalScores, inds, axis: -1)
-
-        if topK > 1, normTopkProb {
-            let denominator = selectedScores.sum(axis: -1, keepDims: true)
-            selectedScores = selectedScores / denominator
-        }
-        selectedScores = selectedScores * routedScalingFactor
-
-        return (inds, selectedScores)
+        selectExperts(x.matmul(weight.T), eScoreCorrectionBias)
     }
 }
 
