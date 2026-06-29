@@ -591,13 +591,26 @@ extension GLM4MoEModel: PipelineParallel {
     public func warmup() {
         // LOCAL forward (no collectives) through this rank's own layers, per-layer eval, to
         // fault the resident shard + compile kernels — the GPU-watchdog fix (run.py:51-57).
+        // Instrumented (SWIFTLM_DIST_DEBUG): per-layer timing surfaces a slow single-layer fault — the
+        // suspect for the intermittent ~45s kIOGPUCommandBufferCallbackErrorTimeout on the first turn.
+        let dbg = ProcessInfo.processInfo.environment["SWIFTLM_DIST_DEBUG"] != nil
+        let rank = ringGroup?.rank ?? -1
+        func wlog(_ s: String) {
+            if dbg { FileHandle.standardError.write(Data("[dist-warmup r\(rank)] \(s)\n".utf8)) }
+        }
+        let t0 = Date()
         let dummy = MLXArray((1 ... 4).map { Int32($0) }).reshaped(1, 4)
         var wx = model.embedTokens(dummy)
         eval(wx)
         let mask = createAttentionMask(h: wx, cache: nil as KVCache?)
-        for layer in model.pipelineLayers {
+        var slowest = 0.0, slowestIdx = -1
+        for (i, layer) in model.pipelineLayers.enumerated() {
+            let lt = Date()
             wx = layer(wx, mask: mask, cache: nil)
             eval(wx)
+            let dt = Date().timeIntervalSince(lt)
+            if dt > slowest { slowest = dt; slowestIdx = i }
+            if dbg && dt > 3.0 { wlog("layer[\(i)] SLOW \(String(format: "%.1f", dt))s") }
         }
         wx = model.norm(wx)
         eval(wx)
@@ -606,5 +619,7 @@ extension GLM4MoEModel: PipelineParallel {
         } else {
             eval(model.embedTokens.asLinear(wx))
         }
+        wlog("done +\(String(format: "%.1f", Date().timeIntervalSince(t0)))s "
+            + "(\(model.pipelineLayers.count) layers; slowest layer[\(slowestIdx)] \(String(format: "%.1f", slowest))s)")
     }
 }
