@@ -197,8 +197,14 @@ public func createCausalMask(
     windowSize: Int? = nil,
     lengths: MLXArray? = nil
 ) -> MLXArray {
-    var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
-    var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
+    // Preserve the Int32 half-open bounds, but construct positions natively.
+    // The Sequence initializer copies every prior position through a Swift
+    // Array on every prefill step, even though only the tensor is needed.
+    let keyPositions = Int32(0) ..< Int32(offset + n)
+    let queryPositions = Int32(offset) ..< Int32(offset + n)
+    var rinds = MLXArray.arange(Int(keyPositions.lowerBound), Int(keyPositions.upperBound))
+    var linds = offset != 0
+        ? MLXArray.arange(Int(queryPositions.lowerBound), Int(queryPositions.upperBound)) : rinds
     linds = linds[0..., .newAxis]
     rinds = rinds[.newAxis]
     var mask = linds .>= rinds
