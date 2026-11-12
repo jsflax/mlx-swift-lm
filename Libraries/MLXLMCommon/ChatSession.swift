@@ -323,13 +323,9 @@ public final class ChatSession {
         videos: consuming [UserInput.Video],
         audios: consuming [UserInput.Audio]
     ) async throws -> String {
-        var output = ""
-        for try await chunk in streamResponse(
-            to: prompt, role: role, images: images, videos: videos, audios: audios
-        ) {
-            output += chunk
-        }
-        return output
+        try await respond(to: [
+            .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
+        ])
     }
 
     /// Produces a response to a prompt.
@@ -372,10 +368,22 @@ public final class ChatSession {
     public func respond(
         to messages: consuming [Chat.Message]
     ) async throws -> String {
+        try Task.checkCancellation()
+        let producer = streamMapWithTask(messages: messages) { $0.chunk }
         var output = ""
-        for try await chunk in streamResponse(to: messages) {
-            output += chunk
+        do {
+            for try await chunk in producer.stream {
+                try Task.checkCancellation()
+                output += chunk
+            }
+        } catch {
+            producer.task.cancel()
+            await producer.task.value
+            throw error
         }
+        if Task.isCancelled { producer.task.cancel() }
+        await producer.task.value
+        try Task.checkCancellation()
         return output
     }
 
@@ -451,6 +459,14 @@ public final class ChatSession {
         }
     }
 
+    /// Streaming generation with the exact session producer task. Cancel and await this
+    /// task when abandoning the stream; it joins generation and releases the cache owner.
+    public func streamDetailsWithTask(
+        to messages: consuming [Chat.Message]
+    ) -> (stream: AsyncThrowingStream<Generation, Error>, task: Task<Void, Never>) {
+        streamMapWithTask(messages: messages) { $0 }
+    }
+
     /// Produces a streaming response to a prompt by transforming the
     /// raw `Generation` values.
     ///
@@ -480,6 +496,13 @@ public final class ChatSession {
         messages: consuming [Chat.Message],
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
+        streamMapWithTask(messages: messages, transform: transform).stream
+    }
+
+    private func streamMapWithTask<R: Sendable>(
+        messages: consuming [Chat.Message],
+        transform: @Sendable @escaping (Generation) -> R?
+    ) -> (stream: AsyncThrowingStream<R, Error>, task: Task<Void, Never>) {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
 
         // images and videos are not Sendable (MLXArray) but they are consumed
@@ -645,7 +668,7 @@ public final class ChatSession {
             task.cancel()
         }
 
-        return stream
+        return (stream, task)
     }
 
     /// Produces a streaming response to a prompt.
