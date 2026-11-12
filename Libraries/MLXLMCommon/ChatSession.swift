@@ -732,6 +732,33 @@ public final class ChatSession {
         )
     }
 
+    /// Prepare a hypothetical continuation without generating, publishing cache
+    /// state or changing tools. The caller must serialize this with generation.
+    /// Counts include the actual retained KV position, not a lossy history replay.
+    public func prepareContinuationContext(to messages: consuming [Chat.Message], tools proposedTools: [ToolSpec]?)
+        async throws -> ChatSessionPreparedContext {
+        let inputMessages = SendableBox(messages)
+        return try await cache.read { [model, instructions, processing, additionalContext,
+                                      generateParameters, speculativeDecoding] cache in
+            try Task.checkCancellation()
+            guard speculativeDecoding == nil else { throw ChatSessionContextError.unsupportedSpeculativeAdmission }
+            var body = instructions.map { [Chat.Message.system($0)] } ?? []
+            let cachedTokens: Int?
+            switch cache {
+            case .empty: cachedTokens = 0
+            case .history(let history): cachedTokens = 0; body.append(contentsOf: history)
+            case .kvcache(_, _, let count): cachedTokens = count
+            }
+            body.append(contentsOf: inputMessages.consume())
+            let processor = await model.processor
+            let input = try await processor.prepare(input: UserInput(chat: body, processing: processing,
+                tools: proposedTools, additionalContext: additionalContext))
+            try Task.checkCancellation()
+            return ChatSessionPreparedContext(cachedTokenCount: cachedTokens,
+                inputTokenCount: input.text.tokens.size, requestedOutputTokens: generateParameters.maxTokens)
+        }
+    }
+
     /// Clear the session history and cache, preserving system instructions.
     public func clear() async {
         await cache.update { cache in

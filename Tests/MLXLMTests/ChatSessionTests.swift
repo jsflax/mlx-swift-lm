@@ -345,6 +345,80 @@ public class ChatSessionTests: XCTestCase {
         }
     }
 
+    /// Uses a tiny synthetic model only to establish an occupied cache. The
+    /// hypothetical admission and rejected real preparation perform no forward.
+    func testDeferredSchemaPreparationCountsActualCacheAndMatchesRealAdmission() async throws {
+        let processor = TestInputProcessor(tokenizer: CatalogCountingTokenizer(),
+            configuration: ModelConfiguration(id: "test"), messageGenerator: DefaultMessageGenerator())
+        let oldTools: [ToolSpec] = [["type": "function", "function": ["name": "discover"] as ToolSpec]]
+        let newTools = oldTools + [["type": "function", "function": ["name": "read_record"] as ToolSpec]]
+        let session = ChatSession(model(processor: processor), instructions: "Current instructions",
+                                  generateParameters: GenerateParameters(maxTokens: 1), tools: oldTools)
+        _ = try await session.respond(to: "Read a record")
+        let replies: [Chat.Message] = [.tool("Actual preceding reply"), .tool("Selected read_record"), .tool("Pending current tool result")]
+        let old = try await session.prepareContinuationContext(to: replies, tools: oldTools)
+        let proposed = try await session.prepareContinuationContext(to: replies, tools: newTools)
+        XCTAssertGreaterThan(try XCTUnwrap(proposed.cachedTokenCount), 0)
+        XCTAssertEqual(old.cachedTokenCount, proposed.cachedTokenCount)
+        XCTAssertEqual(proposed.inputTokenCount - old.inputTokenCount, 5)
+        XCTAssertEqual(try proposed.promptTokenCount(), try XCTUnwrap(proposed.cachedTokenCount) + proposed.inputTokenCount)
+        XCTAssertEqual(session.tools?.count, 1, "A proposal cannot publish tool changes")
+        let actual = PreparedContextRecorder()
+        session.tools = newTools
+        session.contextAdmission = { value in actual.record(value); throw ProvisionalAdmissionRefused() }
+        do {
+            _ = try await session.respond(to: replies)
+            XCTFail("Admission must fail before generation")
+        } catch is ProvisionalAdmissionRefused { }
+        let measured = try XCTUnwrap(actual.value)
+        XCTAssertEqual(measured.cachedTokenCount, proposed.cachedTokenCount)
+        XCTAssertEqual(measured.inputTokenCount, proposed.inputTokenCount)
+        let retry = try await session.prepareContinuationContext(to: replies, tools: newTools)
+        XCTAssertEqual(try retry.promptTokenCount(), try proposed.promptTokenCount(), "Failed preparation must preserve cache position")
+    }
+
+    func testDeferredSchemaPreparationKeepsRestoredHistoryAndPendingReplyOrder() async throws {
+        let (recorded, continuation) = AsyncStream<[RecordedMessage]>.makeStream()
+        let processor = TestInputProcessor(tokenizer: CatalogCountingTokenizer(), configuration: ModelConfiguration(id: "test"),
+            messageGenerator: RecordingMessageGenerator(continuation: continuation))
+        let session = ChatSession(model(processor: processor), instructions: "Keep instructions",
+            history: [.user("Protected user"), .assistant("Discovery call")], generateParameters: GenerateParameters(maxTokens: 1))
+        let prepared = try await session.prepareContinuationContext(
+            to: [.tool("Denied earlier call"), .tool("Discovery reply"), .tool("Pending current tool result")], tools: [])
+        continuation.finish()
+        var calls: [[RecordedMessage]] = []
+        for await call in recorded { calls.append(call) }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0].map(\.content), ["Keep instructions", "Protected user", "Discovery call",
+            "Denied earlier call", "Discovery reply", "Pending current tool result"])
+        XCTAssertEqual(prepared.cachedTokenCount, 0)
+        await session.withCache { XCTAssertNil($0, "Read-only preparation cannot realize a cache") }
+    }
+
+    private struct ProvisionalAdmissionRefused: Error {}
+    private final class PreparedContextRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: ChatSessionPreparedContext?
+        var value: ChatSessionPreparedContext? { lock.withLock { stored } }
+        func record(_ value: ChatSessionPreparedContext) { lock.withLock { stored = value } }
+    }
+    private struct CatalogCountingTokenizer: MLXLMCommon.Tokenizer {
+        let base = TestTokenizer()
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { base.encode(text: text, addSpecialTokens: addSpecialTokens) }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { base.decode(tokenIds: tokenIds, skipSpecialTokens: skipSpecialTokens) }
+        func convertTokenToId(_ token: String) -> Int? { base.convertTokenToId(token) }
+        func convertIdToToken(_ id: Int) -> String? { base.convertIdToToken(id) }
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var eosTokenId: Int? { base.eosTokenId }
+        var unknownToken: String? { nil }
+        var unknownTokenId: Int? { base.unknownTokenId }
+        func applyChatTemplate(messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+                               additionalContext: [String: any Sendable]?) throws -> [Int] {
+            Array(repeating: 1, count: 8 + messages.count * 2 + (tools?.count ?? 0) * 5)
+        }
+    }
+
     /// something that looks like a view model
     @MainActor class ChatModel {
         let session: ChatSession
