@@ -440,6 +440,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 public typealias ModelRegistry = LLMRegistry
 
 private struct LLMUserInputProcessor: UserInputProcessor {
+    var supportsConversationReplay: Bool { true }
 
     let tokenizer: Tokenizer
     let configuration: ModelConfiguration
