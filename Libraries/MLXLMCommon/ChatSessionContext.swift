@@ -5,11 +5,15 @@ public struct ChatSessionPreparedContext: Sendable {
     public let cachedTokenCount: Int?
     public let inputTokenCount: Int
     public let requestedOutputTokens: Int?
+    /// Distinct realized KV backing bytes, captured inside the exact serial
+    /// cache scope. Nil means unproven; never infer this from token count.
+    public let residentCacheBytes: UInt64?
 
-    public init(cachedTokenCount: Int?, inputTokenCount: Int, requestedOutputTokens: Int?) {
+    public init(cachedTokenCount: Int?, inputTokenCount: Int, requestedOutputTokens: Int?, residentCacheBytes: UInt64? = nil) {
         self.cachedTokenCount = cachedTokenCount
         self.inputTokenCount = inputTokenCount
         self.requestedOutputTokens = requestedOutputTokens
+        self.residentCacheBytes = residentCacheBytes
     }
 
     /// Exact logical position after the joined, non-speculative iterator.

@@ -65,7 +65,7 @@ public final class ChatSession {
 
     enum Cache {
         case empty
-        case kvcache([KVCache], draftKVCache: [KVCache]?, logicalTokenCount: Int? = nil)
+        case kvcache([KVCache], draftKVCache: [KVCache]?, logicalTokenCount: Int? = nil, exclusivelyOwned: Bool = false)
         case history([Chat.Message])
     }
 
@@ -552,22 +552,26 @@ public final class ChatSession {
                     var kvCache: [KVCache]
                     var draftKVCache: [KVCache]?
                     var logicalTokenCount: Int?
+                    let exclusivelyOwned: Bool
                     switch cache {
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
                         draftKVCache = nil
                         logicalTokenCount = 0
+                        exclusivelyOwned = true
 
-                    case .kvcache(let array, let storedDraftCache, let storedTokenCount):
+                    case .kvcache(let array, let storedDraftCache, let storedTokenCount, let owned):
                         kvCache = array
                         draftKVCache = storedDraftCache
                         logicalTokenCount = storedTokenCount
+                        exclusivelyOwned = owned
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = model.newCache(parameters: generateParameters)
                         draftKVCache = nil
                         logicalTokenCount = 0
+                        exclusivelyOwned = true
                         messages.append(contentsOf: history)
                     }
 
@@ -584,7 +588,8 @@ public final class ChatSession {
                         try Task.checkCancellation()
                         var roundParameters = generateParameters
                         let preparedContext = ChatSessionPreparedContext(cachedTokenCount: logicalTokenCount,
-                            inputTokenCount: input.text.tokens.size, requestedOutputTokens: generateParameters.maxTokens)
+                            inputTokenCount: input.text.tokens.size, requestedOutputTokens: generateParameters.maxTokens,
+                            residentCacheBytes: contextAdmission == nil || !exclusivelyOwned ? nil : KVCacheResidency.residentBytes(in: kvCache))
                         if let contextAdmission {
                             guard speculativeDecoding == nil else {
                                 throw ChatSessionContextError.unsupportedSpeculativeAdmission
@@ -603,7 +608,7 @@ public final class ChatSession {
                         // already-published cache. Never reuse its old logical
                         // position; successful joined decoding publishes a new one.
                         if case .kvcache = cache {
-                            cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: nil)
+                            cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: nil, exclusivelyOwned: exclusivelyOwned)
                         }
                         // Select the token iterator based on speculative decoding configuration.
                         let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
@@ -654,7 +659,7 @@ public final class ChatSession {
                             )
                         }
 
-                        cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: logicalTokenCount)
+                        cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: logicalTokenCount, exclusivelyOwned: exclusivelyOwned)
                         var pendingToolCalls: [ToolCall] = []
 
                         for await item in genStream {
@@ -681,7 +686,7 @@ public final class ChatSession {
                         if speculativeDecoding == nil {
                             logicalTokenCount = preparedContext.position(afterGeneratedTokens: counter.value)
                         } else { logicalTokenCount = nil }
-                        cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: logicalTokenCount)
+                        cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: logicalTokenCount, exclusivelyOwned: exclusivelyOwned)
                         try Task.checkCancellation()
 
                         // dispatch all tool calls from this generation pass
@@ -744,10 +749,12 @@ public final class ChatSession {
             guard speculativeDecoding == nil else { throw ChatSessionContextError.unsupportedSpeculativeAdmission }
             var body = instructions.map { [Chat.Message.system($0)] } ?? []
             let cachedTokens: Int?
+            var residentBytes: UInt64? = 0
             switch cache {
             case .empty: cachedTokens = 0
             case .history(let history): cachedTokens = 0; body.append(contentsOf: history)
-            case .kvcache(_, _, let count): cachedTokens = count
+            case .kvcache(let current, _, let count, let owned):
+                cachedTokens = count; residentBytes = owned ? KVCacheResidency.residentBytes(in: current) : nil
             }
             body.append(contentsOf: inputMessages.consume())
             let processor = await model.processor
@@ -755,8 +762,17 @@ public final class ChatSession {
                 tools: proposedTools, additionalContext: additionalContext))
             try Task.checkCancellation()
             return ChatSessionPreparedContext(cachedTokenCount: cachedTokens,
-                inputTokenCount: input.text.tokens.size, requestedOutputTokens: generateParameters.maxTokens)
+                inputTokenCount: input.text.tokens.size, requestedOutputTokens: generateParameters.maxTokens,
+                residentCacheBytes: residentBytes)
         }
+    }
+
+    /// Replace only transient KV with an authoritative replay supplied by its
+    /// owner after the exact producer joined. A failed later summary can replay
+    /// the same messages; clearing compute state is not clearing conversation.
+    public func restoreHistory(_ history: consuming [Chat.Message]) async {
+        let transfer = SendableBox(history)
+        await cache.update { cache in cache = .history(transfer.consume()) }
     }
 
     /// Clear the session history and cache, preserving system instructions.
@@ -782,7 +798,7 @@ public final class ChatSession {
     {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _, _):
+            case .kvcache(let cache, _, _, _):
                 return try await body(cache)
             default:
                 return try await body(nil)
@@ -801,7 +817,7 @@ public final class ChatSession {
     public func saveCache(to url: URL) async throws {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _, _):
+            case .kvcache(let cache, _, _, _):
                 try savePromptCache(url: url, cache: cache)
             default:
                 throw ChatSessionError.noCacheAvailable
