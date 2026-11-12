@@ -78,6 +78,9 @@ public final class ChatSession {
     /// cache position. Return this round's output allowance; throwing performs no
     /// model forward and does not replace an empty/restored cache.
     public var contextAdmission: (@Sendable (ChatSessionPreparedContext) throws -> Int)?
+    /// Optional asynchronous freshness check and synchronous producer fence.
+    /// Called after tokenizer/iterator preparation, immediately around generateTask.
+    public var generationAdmission: ChatSessionGenerationAdmission?
     public var additionalContext: [String: any Sendable]?
     public var tools: [ToolSpec]?
     public var toolDispatch: (@Sendable (ToolCall) async throws -> String)?
@@ -517,10 +520,14 @@ public final class ChatSession {
             [
                 model,
                 instructions, processing, tools, toolDispatch,
-                additionalContext, cache, generateParameters, speculativeDecoding, contextAdmission
+                additionalContext, cache, generateParameters, speculativeDecoding, contextAdmission, generationAdmission
             ] in
             do {
                 try await cache.update { cache in
+                    // Iterator preparation may enqueue work before the host's
+                    // final admission refuses/cancels. Keep cache custody until
+                    // that work joins, including when no genTask was created.
+                    defer { if generationAdmission != nil { Stream().synchronize() } }
 
                     // these are all Sendable
                     let processor = await model.processor
@@ -637,26 +644,30 @@ public final class ChatSession {
                                 numDraftTokens: speculativeDecoding.numDraftTokens
                             )
 
-                            (genStream, genTask) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                tools: tools
-                            )
+                            try await generationAdmission?.validate()
+                            try Task.checkCancellation()
+                            func start() -> (AsyncStream<Generation>, Task<Void, Never>) {
+                                MLXLMCommon.generateTask(promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration, tokenizer: tokenizer,
+                                    iterator: iterator, tools: tools)
+                            }
+                            if let generationAdmission { (genStream, genTask) = try generationAdmission.start(start) }
+                            else { (genStream, genTask) = start() }
                         } else {
                             // Standard path with no speculative decoding.
                             let iterator = ChatSessionCountingIterator(try TokenIterator(
                                 input: input, model: model, cache: kvCache,
                                 parameters: roundParameters), counter: counter)
 
-                            (genStream, genTask) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                tools: tools
-                            )
+                            try await generationAdmission?.validate()
+                            try Task.checkCancellation()
+                            func start() -> (AsyncStream<Generation>, Task<Void, Never>) {
+                                MLXLMCommon.generateTask(promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration, tokenizer: tokenizer,
+                                    iterator: iterator, tools: tools)
+                            }
+                            if let generationAdmission { (genStream, genTask) = try generationAdmission.start(start) }
+                            else { (genStream, genTask) = start() }
                         }
 
                         cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: logicalTokenCount, exclusivelyOwned: exclusivelyOwned)
@@ -836,3 +847,26 @@ public enum ChatSessionError: LocalizedError {
     }
 }
 
+
+/// Keeps host-specific mailbox types out of the model library. The synchronous
+/// start closure must execute exactly once or throw before producer creation.
+public struct ChatSessionGenerationAdmission: Sendable {
+    private let validateInput: @Sendable () async throws -> Void
+    private let startProducer: @Sendable (() throws -> Void) throws -> Void
+    public init(validate: @escaping @Sendable () async throws -> Void,
+                start: @escaping @Sendable (() throws -> Void) throws -> Void) {
+        validateInput = validate; startProducer = start
+    }
+    public func validate() async throws { try await validateInput() }
+    public func start<Value>(_ create: () throws -> Value) throws -> Value {
+        var value: Value?
+        var started = false
+        try startProducer {
+            guard !started else { throw CancellationError() }
+            started = true
+            value = try create()
+        }
+        guard let value else { throw CancellationError() }
+        return value
+    }
+}
