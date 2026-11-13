@@ -81,6 +81,9 @@ public final class ChatSession {
     /// Optional asynchronous freshness check and synchronous producer fence.
     /// Called after tokenizer/iterator preparation, immediately around generateTask.
     public var generationAdmission: ChatSessionGenerationAdmission?
+    /// Internal completion boundary for lifetime tests. Configure before starting
+    /// a producer, like the other session options; each producer captures it once.
+    var synchronizePreparedWork: @Sendable () -> Void = { Stream().synchronize() }
     public var additionalContext: [String: any Sendable]?
     public var tools: [ToolSpec]?
     public var toolDispatch: (@Sendable (ToolCall) async throws -> String)?
@@ -520,14 +523,16 @@ public final class ChatSession {
             [
                 model,
                 instructions, processing, tools, toolDispatch,
-                additionalContext, cache, generateParameters, speculativeDecoding, contextAdmission, generationAdmission
+                additionalContext, cache, generateParameters, speculativeDecoding, contextAdmission, generationAdmission,
+                synchronizePreparedWork
             ] in
             do {
                 try await cache.update { cache in
-                    // Iterator preparation may enqueue work before the host's
-                    // final admission refuses/cancels. Keep cache custody until
-                    // that work joins, including when no genTask was created.
-                    defer { if generationAdmission != nil { Stream().synchronize() } }
+                    // Preparation can enqueue work before cancellation or final
+                    // admission prevents producer creation. Keep cache custody
+                    // until that work drains, including without an admission hook.
+                    var preparedWorkNeedsDrain = generationAdmission != nil
+                    defer { if preparedWorkNeedsDrain { synchronizePreparedWork() } }
 
                     // these are all Sendable
                     let processor = await model.processor
@@ -619,6 +624,7 @@ public final class ChatSession {
                         }
                         // Select the token iterator based on speculative decoding configuration.
                         let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
+                        preparedWorkNeedsDrain = true
 
                         if let speculativeDecoding {
                             // Extract the draft model from its container (same pattern as the main model).
@@ -691,6 +697,10 @@ public final class ChatSession {
                         // work may continue (briefly) and use the KVCache
                         if Task.isCancelled { genTask.cancel() }
                         await genTask.value
+                        // The generator's completion includes its MLX fence. Keep
+                        // the existing hook fence, without adding a second one
+                        // to a successful no-hook turn.
+                        preparedWorkNeedsDrain = generationAdmission != nil
                         // TokenIterator consumes the prepared prompt and one
                         // cached position for every raw iteration, including EOS.
                         // This does not inspect recurrent-cache offset defaults.
