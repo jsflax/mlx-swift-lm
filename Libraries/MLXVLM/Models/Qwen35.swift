@@ -524,12 +524,16 @@ enum Qwen35Language {
             let b = inProjB(inputs)
             let a = inProjA(inputs)
 
+            // The conv state is the last `nKeep` conv inputs of the previous forward. It must be
+            // exactly [B, nKeep, convDim] both when freshly zeroed and when carried across turns,
+            // so the `concatenated` below is shape-valid for any new length S — a single decode
+            // token or a continuation prefill shorter than the kernel.
+            let nKeep = max(0, convKernelSize - 1)
             let convState: MLXArray
             if let cacheState = cache?[0] {
                 convState = cacheState
             } else {
-                convState = MLXArray.zeros(
-                    [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
+                convState = MLXArray.zeros([B, nKeep, convDim], dtype: inputs.dtype)
             }
 
             if let mask {
@@ -537,8 +541,22 @@ enum Qwen35Language {
             }
 
             let convInput = concatenated([convState, mixedQKV], axis: 1)
-            if let cache, convKernelSize > 1 {
-                cache[0] = convInput[0..., (-(convKernelSize - 1))...]
+            if let cache, nKeep > 0 {
+                if let lengths = cache.currentLengths {
+                    // Right-padded batch (`prepare(lengths:)`): a row's valid tokens end at
+                    // `lengths[b]`, so its state is the `nKeep` inputs ending there, not the padded
+                    // tail of the chunk. `ends` is clipped to S because `convInput` holds
+                    // S + nKeep rows and the gather must stay in bounds. Mirrors mlx-lm qwen3_5.
+                    let ends = clip(lengths, min: 0, max: S)
+                    let positions =
+                        (ends[0..., .newAxis] + MLXArray(0 ..< nKeep))[.ellipsis, .newAxis]
+                    cache[0] = MLX.takeAlong(convInput, positions, axis: 1)
+                } else {
+                    // Materialise the tail (Python: `mx.contiguous(conv_input[:, -n_keep:, :])`).
+                    // A bare slice is a view that keeps the whole [B, S + nKeep, convDim] prefill
+                    // activation of this layer alive for as long as the cache is carried.
+                    cache[0] = MLX.contiguous(convInput[0..., (-nKeep)..., 0...])
+                }
             }
 
             let convOut = silu(conv1d(convInput))
@@ -572,6 +590,10 @@ enum Qwen35Language {
 
             if let cache {
                 cache[1] = state
+                // Python `cache.advance(S)`: shift the prepared `lengths` / `leftPadding` by the
+                // tokens just consumed so the next chunk's SSM mask is relative to that chunk
+                // rather than re-masking the first `leftPadding` positions of every chunk.
+                cache.advance(S)
             }
 
             out = norm(out, gate: z)
@@ -815,37 +837,24 @@ enum Qwen35Language {
 
             var positionIds = providedPositionIds
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
-                if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
-                    || ropeDeltas == nil
-                    || cache == nil
-                {
-                    if let precomputedPositionIds {
-                        let seqLength = inputs.dim(1)
-                        positionIds =
-                            precomputedPositionIds[
-                                0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
-                    } else {
-                        let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
-                            inputIds: inputs,
-                            imageGridTHW: imageGridTHW,
-                            videoGridTHW: videoGridTHW,
-                            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
-                            imageTokenId: config.imageTokenId,
-                            videoTokenId: config.videoTokenId,
-                            visionStartTokenId: config.visionStartTokenId,
-                            attentionMask: ropeMask)
-                        positionIds = computed
-                        state[precomputedPositionIdsKey] = computed
-                        state[ropeDeltasKey] = deltas
-                    }
-                } else {
-                    let batchSize = inputs.dim(0)
-                    let seqLength = inputs.dim(1)
+                let batchSize = inputs.dim(0)
+                let seqLength = inputs.dim(1)
+                let chunkEnd = cacheOffset + seqLength
 
-                    var delta = MLXArray(cacheOffset).asType(.int32)
-                    if let ropeDeltas {
-                        delta = delta + ropeDeltas.asType(.int32)
-                    }
+                // Position ids live in `LMOutput.State`, not the model (#283), so the driver must
+                // hand the state back on every call: the full mrope index is computed once at
+                // offset 0 and every later chunk / decode step derives its positions from the
+                // carried `ropeDeltas` (the shift between token index and mrope position that the
+                // prefix's vision tokens introduced). Whoever resets the cache must drop the state.
+                if let precomputedPositionIds, precomputedPositionIds.dim(2) >= chunkEnd {
+                    // A window of the prompt the positions were computed for (offset 0 on a fresh
+                    // cache, or a later prefill chunk of the same prompt): slicing keeps the 3-D
+                    // positions of any vision tokens inside the window intact.
+                    positionIds = precomputedPositionIds[0..., 0..., cacheOffset ..< chunkEnd]
+                } else if let ropeDeltas, cacheOffset > 0 {
+                    // Continuation of an existing cache: text positions continue linearly from
+                    // `cacheOffset` shifted by the carried deltas (HF: `cache_position + rope_deltas`).
+                    var delta = MLXArray(cacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
 
                     var base = MLXArray(0 ..< seqLength).asType(.int32)
                     base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
@@ -861,6 +870,34 @@ enum Qwen35Language {
                     base = base + delta[0..., .newAxis]
                     positionIds = broadcast(
                         base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+                } else {
+                    let (chunkPositions, deltas) = Qwen3VLLanguage.getRopeIndex(
+                        inputIds: inputs,
+                        imageGridTHW: imageGridTHW,
+                        videoGridTHW: videoGridTHW,
+                        spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                        imageTokenId: config.imageTokenId,
+                        videoTokenId: config.videoTokenId,
+                        visionStartTokenId: config.visionStartTokenId,
+                        attentionMask: ropeMask)
+                    let computed: MLXArray
+                    if cacheOffset > 0 {
+                        // No carried deltas (the driver passed `state: nil`) but the cache already
+                        // holds `cacheOffset` tokens: shift the chunk-local positions so this chunk
+                        // continues the sequence instead of restarting at 0. Exact for a text-only
+                        // prefix; a prefix with vision tokens needs the threaded state. The
+                        // chunk-local deltas stay valid for the delta path above because the shift
+                        // and the new offset cancel.
+                        computed =
+                            chunkPositions + MLXArray(cacheOffset).asType(chunkPositions.dtype)
+                    } else {
+                        computed = chunkPositions
+                    }
+                    positionIds = computed
+                    // Only a full-prompt index (offset 0) is worth keeping for slicing; a shifted
+                    // chunk-local one would be mistaken for a fresh prompt's positions.
+                    state[precomputedPositionIdsKey] = cacheOffset == 0 ? computed : nil
+                    state[ropeDeltasKey] = deltas
                 }
             }
 

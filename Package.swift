@@ -40,7 +40,7 @@ let package = Package(
         // `DistributedGroup` bindings this fork's pipeline-parallel models require. Path dep:
         // overrides the same SwiftPM identity ("mlx-swift") for the whole graph, and keeps us
         // off any ml-explore/mlx-swift URL ref (identity consistency — see Orbital plan M2).
-        .package(path: "../mlx-swift"),
+        .package(url: "https://github.com/jsflax/mlx-swift", exact: "0.31.4-distributed.1"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
     ],
     targets: [

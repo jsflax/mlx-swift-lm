@@ -250,8 +250,11 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let convInput = concatenated([convState, qkv], axis: 1)
-        if let cache {
-            cache[0] = convInput[0..., (-(convKernelSize - 1))...]
+        if let cache, convKernelSize > 1 {
+            // Materialise the carried tail (Python: `mx.contiguous(conv_input[:, -n_keep:, :])`) — a bare slice
+            // is a view that keeps this layer's whole [B, S + nKeep, convDim] prefill activation alive for as
+            // long as the cache is carried across turns. Same as the VLM port (MLXVLM/Models/Qwen35.swift).
+            cache[0] = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
         }
 
         let convOut = silu(conv1d(convInput))
@@ -287,6 +290,7 @@ final class Qwen35GatedDeltaNet: Module {
 
         if let cache {
             cache[1] = state
+            cache.advance(S)   // Python `cache.advance(S)`: shift prepared lengths/leftPadding past this chunk
         }
 
         out = norm(out, gate: z)

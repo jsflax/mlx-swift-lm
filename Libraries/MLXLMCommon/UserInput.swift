@@ -408,6 +408,9 @@ public struct UserInput {
 ///
 /// See also ``ModelContext``.
 public protocol UserInputProcessor: Sendable {
+    /// Whether preparing a complete text chat faithfully replays all messages.
+    /// Incremental processors that only consume the last message leave this false.
+    var supportsConversationReplay: Bool { get }
     func prepare(input: UserInput) async throws -> LMInput
 }
 
@@ -438,4 +441,8 @@ public struct StandInUserInputProcessor: UserInputProcessor {
     public func prepare(input: UserInput) throws -> LMInput {
         throw UserInputError.notImplemented
     }
+}
+
+public extension UserInputProcessor {
+    var supportsConversationReplay: Bool { false }
 }

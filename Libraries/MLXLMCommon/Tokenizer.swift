@@ -95,27 +95,38 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
 
     public mutating func next() -> String? {
         let newSegment = tokenizer.decode(tokenIds: segmentTokens)
-        let new = newSegment.suffix(newSegment.count - segment.count)
 
-        // if the new segment ends with REPLACEMENT CHARACTER this means
-        // that the token didn't produce a complete unicode character
-        if new.last == "\u{fffd}" {
+        // A trailing REPLACEMENT CHARACTER means the newest token ends inside a multi-byte UTF-8
+        // sequence (byte-level BPE splits e.g. " \u{1F44B}" into " \xF0\x9F\x91" + "\x8B"). Hold
+        // everything until a later token completes it. Checked on the last SCALAR of the decoded window
+        // (a Character check can miss an FFFD fused into a cluster, e.g. after a Prepend scalar).
+        if newSegment.unicodeScalars.last == "\u{FFFD}" {
             return nil
         }
 
+        // Diff in UNICODE SCALARS, not Characters. A token that adds a combining mark, ZWJ, skin-tone
+        // modifier, variation selector or a flag's second regional indicator extends the previous
+        // grapheme cluster without changing `String.count`, so grapheme arithmetic silently dropped
+        // those scalars ("\u{1F468}\u{200D}\u{1F469}" streamed as "\u{1F468}"). Concatenating the
+        // scalar pieces reproduces the full decode exactly.
+        let all = newSegment.unicodeScalars
+        let committed = segment.unicodeScalars.count
+        let new =
+            all.count > committed
+            ? String(all[all.index(all.startIndex, offsetBy: committed)...]) : ""
+
         // Reset the decode window at safe boundaries so `decode(segmentTokens)` stays O(1) amortized
-        // instead of re-decoding an unbounded segment EVERY token — an O(n^2) host cost that dominates
-        // long, newline-sparse generations (e.g. GLM <think> reasoning: ~0.45 ms/token-in-segment grows
-        // to >100 ms/token by token 256, halving end-to-end tok/s vs the model's true rate). We only reach
-        // here after a COMPLETE unicode char was emitted (the replacement-char guard above returns early),
-        // so capping the window can never split a multi-byte char. 16 is well past any valid UTF-8 char
-        // (≤4 bytes) yet keeps the per-token decode bounded. Output is byte-identical to the uncapped path.
-        if new.hasSuffix("\n") || segmentTokens.count >= 16 {
+        // instead of re-decoding an unbounded segment EVERY token (an O(n^2) host cost on long,
+        // newline-sparse generations). Only reset once this step produced VISIBLE text that does not
+        // end in a partial sequence: a byte-fallback decoder (`<0xNN>` tokens) renders a trailing byte
+        // run as NOTHING until a normal token follows, so resetting on an empty `new` would orphan the
+        // run's leading bytes and later surface them as U+FFFD.
+        if !new.isEmpty && (new.hasSuffix("\n") || segmentTokens.count >= 16) {
             startNewSegment()
         } else {
             self.segment = newSegment
         }
 
-        return String(new)
+        return new
     }
 }

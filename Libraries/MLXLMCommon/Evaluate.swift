@@ -490,13 +490,6 @@ public struct PenaltyProcessor: LogitProcessor {
     }
 }
 
-/// Common properties shared by token-generating iterators.
-public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
-    var maxTokens: Int? { get }
-    var tokenCount: Int { get }
-    var promptPrefillTime: TimeInterval { get }
-}
-
 /// Generator of tokens.
 ///
 /// This is typically used via a call to ``generate(input:cache:parameters:context:wiredMemoryTicket:tools:)`` returning `AsyncStream<Generation>`.

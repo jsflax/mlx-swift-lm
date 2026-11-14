@@ -65,7 +65,7 @@ public final class ChatSession {
 
     enum Cache {
         case empty
-        case kvcache([KVCache], draftKVCache: [KVCache]?)
+        case kvcache([KVCache], draftKVCache: [KVCache]?, logicalTokenCount: Int? = nil, exclusivelyOwned: Bool = false)
         case history([Chat.Message])
     }
 
@@ -74,6 +74,16 @@ public final class ChatSession {
     private let cache: SerialAccessContainer<Cache>
     public var processing: UserInput.Processing
     public var generateParameters: GenerateParameters
+    /// Opt-in host admission over the exact prepared input and tracked logical
+    /// cache position. Return this round's output allowance; throwing performs no
+    /// model forward and does not replace an empty/restored cache.
+    public var contextAdmission: (@Sendable (ChatSessionPreparedContext) throws -> Int)?
+    /// Optional asynchronous freshness check and synchronous producer fence.
+    /// Called after tokenizer/iterator preparation, immediately around generateTask.
+    public var generationAdmission: ChatSessionGenerationAdmission?
+    /// Internal completion boundary for lifetime tests. Configure before starting
+    /// a producer, like the other session options; each producer captures it once.
+    var synchronizePreparedWork: @Sendable () -> Void = { Stream().synchronize() }
     public var additionalContext: [String: any Sendable]?
     public var tools: [ToolSpec]?
     public var toolDispatch: (@Sendable (ToolCall) async throws -> String)?
@@ -323,13 +333,9 @@ public final class ChatSession {
         videos: consuming [UserInput.Video],
         audios: consuming [UserInput.Audio]
     ) async throws -> String {
-        var output = ""
-        for try await chunk in streamResponse(
-            to: prompt, role: role, images: images, videos: videos, audios: audios
-        ) {
-            output += chunk
-        }
-        return output
+        try await respond(to: [
+            .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
+        ])
     }
 
     /// Produces a response to a prompt.
@@ -372,10 +378,22 @@ public final class ChatSession {
     public func respond(
         to messages: consuming [Chat.Message]
     ) async throws -> String {
+        try Task.checkCancellation()
+        let producer = streamMapWithTask(messages: messages) { $0.chunk }
         var output = ""
-        for try await chunk in streamResponse(to: messages) {
-            output += chunk
+        do {
+            for try await chunk in producer.stream {
+                try Task.checkCancellation()
+                output += chunk
+            }
+        } catch {
+            producer.task.cancel()
+            await producer.task.value
+            throw error
         }
+        if Task.isCancelled { producer.task.cancel() }
+        await producer.task.value
+        try Task.checkCancellation()
         return output
     }
 
@@ -451,6 +469,14 @@ public final class ChatSession {
         }
     }
 
+    /// Streaming generation with the exact session producer task. Cancel and await this
+    /// task when abandoning the stream; it joins generation and releases the cache owner.
+    public func streamDetailsWithTask(
+        to messages: consuming [Chat.Message]
+    ) -> (stream: AsyncThrowingStream<Generation, Error>, task: Task<Void, Never>) {
+        streamMapWithTask(messages: messages) { $0 }
+    }
+
     /// Produces a streaming response to a prompt by transforming the
     /// raw `Generation` values.
     ///
@@ -480,6 +506,13 @@ public final class ChatSession {
         messages: consuming [Chat.Message],
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
+        streamMapWithTask(messages: messages, transform: transform).stream
+    }
+
+    private func streamMapWithTask<R: Sendable>(
+        messages: consuming [Chat.Message],
+        transform: @Sendable @escaping (Generation) -> R?
+    ) -> (stream: AsyncThrowingStream<R, Error>, task: Task<Void, Never>) {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
 
         // images and videos are not Sendable (MLXArray) but they are consumed
@@ -490,10 +523,16 @@ public final class ChatSession {
             [
                 model,
                 instructions, processing, tools, toolDispatch,
-                additionalContext, cache, generateParameters, speculativeDecoding
+                additionalContext, cache, generateParameters, speculativeDecoding, contextAdmission, generationAdmission,
+                synchronizePreparedWork
             ] in
             do {
                 try await cache.update { cache in
+                    // Preparation can enqueue work before cancellation or final
+                    // admission prevents producer creation. Keep cache custody
+                    // until that work drains, including without an admission hook.
+                    var preparedWorkNeedsDrain = generationAdmission != nil
+                    defer { if preparedWorkNeedsDrain { synchronizePreparedWork() } }
 
                     // these are all Sendable
                     let processor = await model.processor
@@ -524,19 +563,27 @@ public final class ChatSession {
 
                     var kvCache: [KVCache]
                     var draftKVCache: [KVCache]?
+                    var logicalTokenCount: Int?
+                    let exclusivelyOwned: Bool
                     switch cache {
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache, draftKVCache: nil)
+                        draftKVCache = nil
+                        logicalTokenCount = 0
+                        exclusivelyOwned = true
 
-                    case .kvcache(let array, let storedDraftCache):
+                    case .kvcache(let array, let storedDraftCache, let storedTokenCount, let owned):
                         kvCache = array
                         draftKVCache = storedDraftCache
+                        logicalTokenCount = storedTokenCount
+                        exclusivelyOwned = owned
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache, draftKVCache: nil)
+                        draftKVCache = nil
+                        logicalTokenCount = 0
+                        exclusivelyOwned = true
                         messages.append(contentsOf: history)
                     }
 
@@ -550,10 +597,34 @@ public final class ChatSession {
                             processing: processing,
                             tools: tools, additionalContext: additionalContext)
                         let input = try await processor.prepare(input: userInput)
+                        try Task.checkCancellation()
+                        var roundParameters = generateParameters
+                        let preparedContext = ChatSessionPreparedContext(cachedTokenCount: logicalTokenCount,
+                            inputTokenCount: input.text.tokens.size, requestedOutputTokens: generateParameters.maxTokens,
+                            residentCacheBytes: contextAdmission == nil || !exclusivelyOwned ? nil : KVCacheResidency.residentBytes(in: kvCache))
+                        if let contextAdmission {
+                            guard speculativeDecoding == nil else {
+                                throw ChatSessionContextError.unsupportedSpeculativeAdmission
+                            }
+                            let allowance = try contextAdmission(preparedContext)
+                            guard allowance > 0 else { throw ChatSessionContextError.invalidOutputAllowance }
+                            roundParameters.maxTokens = allowance
+                            try Task.checkCancellation()
+                        }
+                        // Admission uses this exact LMInput. Keep .empty/.history
+                        // staged until it succeeds; update() does not roll back.
                         messages.removeAll()
+                        let counter = ChatSessionTokenCounter()
 
+                        // A failing model.prepare may have partially touched an
+                        // already-published cache. Never reuse its old logical
+                        // position; successful joined decoding publishes a new one.
+                        if case .kvcache = cache {
+                            cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: nil, exclusivelyOwned: exclusivelyOwned)
+                        }
                         // Select the token iterator based on speculative decoding configuration.
                         let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
+                        preparedWorkNeedsDrain = true
 
                         if let speculativeDecoding {
                             // Extract the draft model from its container (same pattern as the main model).
@@ -566,7 +637,6 @@ public final class ChatSession {
                             // exactly like the main model's KV cache.
                             if draftKVCache == nil {
                                 draftKVCache = draftModel.newCache(parameters: generateParameters)
-                                cache = .kvcache(kvCache, draftKVCache: draftKVCache)
                             }
                             let draftCache = draftKVCache!
 
@@ -576,32 +646,37 @@ public final class ChatSession {
                                 draftModel: draftModel,
                                 mainCache: kvCache,
                                 draftCache: draftCache,
-                                parameters: generateParameters,
+                                parameters: roundParameters,
                                 numDraftTokens: speculativeDecoding.numDraftTokens
                             )
 
-                            (genStream, genTask) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                tools: tools
-                            )
+                            try await generationAdmission?.validate()
+                            try Task.checkCancellation()
+                            func start() -> (AsyncStream<Generation>, Task<Void, Never>) {
+                                MLXLMCommon.generateTask(promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration, tokenizer: tokenizer,
+                                    iterator: iterator, tools: tools)
+                            }
+                            if let generationAdmission { (genStream, genTask) = try generationAdmission.start(start) }
+                            else { (genStream, genTask) = start() }
                         } else {
                             // Standard path with no speculative decoding.
-                            let iterator = try TokenIterator(
+                            let iterator = ChatSessionCountingIterator(try TokenIterator(
                                 input: input, model: model, cache: kvCache,
-                                parameters: generateParameters)
+                                parameters: roundParameters), counter: counter)
 
-                            (genStream, genTask) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                tools: tools
-                            )
+                            try await generationAdmission?.validate()
+                            try Task.checkCancellation()
+                            func start() -> (AsyncStream<Generation>, Task<Void, Never>) {
+                                MLXLMCommon.generateTask(promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration, tokenizer: tokenizer,
+                                    iterator: iterator, tools: tools)
+                            }
+                            if let generationAdmission { (genStream, genTask) = try generationAdmission.start(start) }
+                            else { (genStream, genTask) = start() }
                         }
 
+                        cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: logicalTokenCount, exclusivelyOwned: exclusivelyOwned)
                         var pendingToolCalls: [ToolCall] = []
 
                         for await item in genStream {
@@ -620,7 +695,20 @@ public final class ChatSession {
                         // wait for the task to complete -- this is important in
                         // the case where we broke the loop early as the generation
                         // work may continue (briefly) and use the KVCache
+                        if Task.isCancelled { genTask.cancel() }
                         await genTask.value
+                        // The generator's completion includes its MLX fence. Keep
+                        // the existing hook fence, without adding a second one
+                        // to a successful no-hook turn.
+                        preparedWorkNeedsDrain = generationAdmission != nil
+                        // TokenIterator consumes the prepared prompt and one
+                        // cached position for every raw iteration, including EOS.
+                        // This does not inspect recurrent-cache offset defaults.
+                        if speculativeDecoding == nil {
+                            logicalTokenCount = preparedContext.position(afterGeneratedTokens: counter.value)
+                        } else { logicalTokenCount = nil }
+                        cache = .kvcache(kvCache, draftKVCache: draftKVCache, logicalTokenCount: logicalTokenCount, exclusivelyOwned: exclusivelyOwned)
+                        try Task.checkCancellation()
 
                         // dispatch all tool calls from this generation pass
                         if let toolDispatch, !pendingToolCalls.isEmpty,
@@ -645,7 +733,7 @@ public final class ChatSession {
             task.cancel()
         }
 
-        return stream
+        return (stream, task)
     }
 
     /// Produces a streaming response to a prompt.
@@ -668,6 +756,44 @@ public final class ChatSession {
             videos: video.map { [$0] } ?? [],
             audios: audio.map { [$0] } ?? [],
         )
+    }
+
+    /// Prepare a hypothetical continuation without generating, publishing cache
+    /// state or changing tools. The caller must serialize this with generation.
+    /// Counts include the actual retained KV position, not a lossy history replay.
+    public func prepareContinuationContext(to messages: consuming [Chat.Message], tools proposedTools: [ToolSpec]?)
+        async throws -> ChatSessionPreparedContext {
+        let inputMessages = SendableBox(messages)
+        return try await cache.read { [model, instructions, processing, additionalContext,
+                                      generateParameters, speculativeDecoding] cache in
+            try Task.checkCancellation()
+            guard speculativeDecoding == nil else { throw ChatSessionContextError.unsupportedSpeculativeAdmission }
+            var body = instructions.map { [Chat.Message.system($0)] } ?? []
+            let cachedTokens: Int?
+            var residentBytes: UInt64? = 0
+            switch cache {
+            case .empty: cachedTokens = 0
+            case .history(let history): cachedTokens = 0; body.append(contentsOf: history)
+            case .kvcache(let current, _, let count, let owned):
+                cachedTokens = count; residentBytes = owned ? KVCacheResidency.residentBytes(in: current) : nil
+            }
+            body.append(contentsOf: inputMessages.consume())
+            let processor = await model.processor
+            let input = try await processor.prepare(input: UserInput(chat: body, processing: processing,
+                tools: proposedTools, additionalContext: additionalContext))
+            try Task.checkCancellation()
+            return ChatSessionPreparedContext(cachedTokenCount: cachedTokens,
+                inputTokenCount: input.text.tokens.size, requestedOutputTokens: generateParameters.maxTokens,
+                residentCacheBytes: residentBytes)
+        }
+    }
+
+    /// Replace only transient KV with an authoritative replay supplied by its
+    /// owner after the exact producer joined. A failed later summary can replay
+    /// the same messages; clearing compute state is not clearing conversation.
+    public func restoreHistory(_ history: consuming [Chat.Message]) async {
+        let transfer = SendableBox(history)
+        await cache.update { cache in cache = .history(transfer.consume()) }
     }
 
     /// Clear the session history and cache, preserving system instructions.
@@ -693,7 +819,7 @@ public final class ChatSession {
     {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _):
+            case .kvcache(let cache, _, _, _):
                 return try await body(cache)
             default:
                 return try await body(nil)
@@ -712,7 +838,7 @@ public final class ChatSession {
     public func saveCache(to url: URL) async throws {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _):
+            case .kvcache(let cache, _, _, _):
                 try savePromptCache(url: url, cache: cache)
             default:
                 throw ChatSessionError.noCacheAvailable
@@ -728,5 +854,29 @@ public enum ChatSessionError: LocalizedError {
 
     public var errorDescription: String? {
         "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
+    }
+}
+
+
+/// Keeps host-specific mailbox types out of the model library. The synchronous
+/// start closure must execute exactly once or throw before producer creation.
+public struct ChatSessionGenerationAdmission: Sendable {
+    private let validateInput: @Sendable () async throws -> Void
+    private let startProducer: @Sendable (() throws -> Void) throws -> Void
+    public init(validate: @escaping @Sendable () async throws -> Void,
+                start: @escaping @Sendable (() throws -> Void) throws -> Void) {
+        validateInput = validate; startProducer = start
+    }
+    public func validate() async throws { try await validateInput() }
+    public func start<Value>(_ create: () throws -> Value) throws -> Value {
+        var value: Value?
+        var started = false
+        try startProducer {
+            guard !started else { throw CancellationError() }
+            started = true
+            value = try create()
+        }
+        guard let value else { throw CancellationError() }
+        return value
     }
 }
