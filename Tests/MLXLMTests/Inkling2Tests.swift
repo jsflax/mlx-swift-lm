@@ -226,8 +226,10 @@ struct Inkling2Tests {
         #expect(firstList.children.count == 2)
         #expect(firstList.children[0] is RotatingKVCache)
         #expect(firstList.children[0].maxSize == 8)
-        let fullVisitList = try #require(cache[9] as? CacheList)  // layer 5 in pass 2
+        let fullVisitList = try #require(cache[8] as? CacheList)  // layer 5 in pass 1 (3 + 1*3 + 2)
         #expect(fullVisitList.children[0] is KVCacheSimple)
+        let fullVisitListPass2 = try #require(cache[11] as? CacheList)  // layer 5 in pass 2 (3 + 2*3 + 2)
+        #expect(fullVisitListPass2.children[0] is KVCacheSimple)
 
         // Sequence length 20 > slidingWindowSize (8) exercises RotatingKVCache ring wrap-around!
         // Test B = 1 (exercises single-row fused SDPA + `(k - rotIdx + S) % S` path) and B = 2.

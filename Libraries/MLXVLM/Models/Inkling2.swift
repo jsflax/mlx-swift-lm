@@ -696,8 +696,6 @@ public struct Inkling2Processor: UserInputProcessor {
         let pw = config.patchWidth
         let rows = (height + ph - 1) / ph
         let cols = (width + pw - 1) / pw
-        let paddedH = rows * ph
-        let paddedW = cols * pw
 
         let meanR = config.imageMean.count > 0 ? config.imageMean[0] : 0.5
         let meanG = config.imageMean.count > 1 ? config.imageMean[1] : 0.5
