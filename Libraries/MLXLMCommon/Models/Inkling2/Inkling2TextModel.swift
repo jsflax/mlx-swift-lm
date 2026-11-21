@@ -272,15 +272,8 @@ package struct Inkling2LogitProjection {
 package enum Inkling2TensorParallel {
     private static func shardSlice(_ w: MLXArray, axis: Int, rank: Int, size: Int) -> MLXArray {
         let ax = axis < 0 ? w.ndim + axis : axis
-        let chunk = w.dim(ax) / size
-        let lo = rank * chunk
-        let hi = lo + chunk
-        var indices = Array(repeating: MLXArrayIndex.ellipsis, count: 0)
-        _ = indices
         let splitParts = split(w, parts: size, axis: ax)
-        let part = contiguous(splitParts[rank])
-        _ = (lo, hi)
-        return part
+        return contiguous(splitParts[rank])
     }
 
     private static func shardAllToSharded(_ linear: Linear, rank: Int, size: Int) -> Linear {
