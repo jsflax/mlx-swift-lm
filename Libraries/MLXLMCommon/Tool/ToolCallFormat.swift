@@ -102,6 +102,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|python_tag|>{ "name": "func", "parameters": {...} }`
     case llama3
 
+    /// Thinking Machines Inkling 2 envelope format.
+    /// Example: `<|message_model|>func<|content_invoke_tool_json|>{"name":"func","args":{...}}<|end_message|>`
+    case inkling2
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -132,6 +136,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return MistralToolCallParser()
         case .llama3:
             return Llama3ToolCallParser()
+        case .inkling2:
+            return Inkling2ToolCallParser()
         }
     }
 
@@ -207,6 +213,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Mistral3 family (mistral3, mistral3_text, etc.)
         if type.hasPrefix("mistral3") {
             return .mistral
+        }
+
+        // Inkling 2 family (inkling2, inkling2_loop, inkling2_text, inkling2_loop_text)
+        if type.hasPrefix("inkling2") {
+            return .inkling2
         }
 
         return nil

@@ -45,6 +45,10 @@ public enum VLMError: LocalizedError, Equatable {
 public struct BaseProcessorConfiguration: Codable, Sendable {
     public let processorClass: String
 
+    public init(processorClass: String) {
+        self.processorClass = processorClass
+    }
+
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
     }
@@ -98,6 +102,8 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        "inkling2": create(Inkling2Configuration.self, Inkling2.init),
+        "inkling2_loop": create(Inkling2Configuration.self, Inkling2.init),
     ])
 }
 
@@ -131,6 +137,8 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
+        "Inkling2Processor": create(
+            Inkling2ProcessorConfiguration.self, Inkling2Processor.init),
     ])
 }
 
@@ -253,6 +261,16 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Describe the image in English"
     )
 
+    static public let inkling2Mini = ModelConfiguration(
+        id: "thinkingmachines/Inkling-2-Mini",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let inkling2Mini4bit = ModelConfiguration(
+        id: "mlx-community/Inkling-2-Mini-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
     static public func all() -> [ModelConfiguration] {
         [
             paligemma3bMix448_8bit,
@@ -268,6 +286,8 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gemma4_E4B_it_4bit,
             gemma4_26BA4B_it_4bit,
             gemma4_31B_it_4bit,
+            inkling2Mini,
+            inkling2Mini4bit,
             smolvlm,
             fastvlm,
         ]
@@ -389,8 +409,16 @@ public final class VLMModelFactory: GenericModelFactory {
                 throw ModelFactoryError.configurationDecodingError(
                     error.filename, configuration.name, decodingError)
             }
-            throw ModelFactoryError.configurationFileError(
-                error.filename, configuration.name, error.underlying)
+            if baseConfig.modelType.lowercased().hasPrefix("inkling2") {
+                // Pre-converted Inkling 2 repos (e.g. `mlx-community/Inkling-2-Mini-4bit`) omit
+                // `processor_config.json` while retaining `vision_config` in `config.json`.
+                processorConfigData = configData
+                baseProcessorConfig = BaseProcessorConfiguration(
+                    processorClass: "Inkling2Processor")
+            } else {
+                throw ModelFactoryError.configurationFileError(
+                    error.filename, configuration.name, error.underlying)
+            }
         }
 
         // Override processor type based on model type for models that need special handling

@@ -217,15 +217,24 @@ public class FusedGateUpSwitchGLU: Module {
     }
 }
 
+private let compiledApplyNVFP4GlobalScale: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { out, selectedGlobalScale in
+    // MLX NVFP4 convention: inv_scale_enc = global_scale / (448 * 6) = global_scale / 2688.0
+    let factor = (selectedGlobalScale.asType(.float32) * Float(1.0 / 2688.0))
+        .expandedDimensions(axes: [-2, -1])
+    return (out.asType(.float32) * factor).asType(out.dtype)
+}
+
 // MARK: - SwitchLinear
 
 public class SwitchLinear: Module, Quantizable {
-    @ModuleInfo(key: "weight") var weight: MLXArray
-    @ModuleInfo(key: "bias") var bias: MLXArray?
+    @ModuleInfo(key: "weight") public var weight: MLXArray
+    @ModuleInfo(key: "bias") public var bias: MLXArray?
 
-    let inputDims: Int
-    let outputDims: Int
-    let numExperts: Int
+    public let inputDims: Int
+    public let outputDims: Int
+    public let numExperts: Int
 
     public init(inputDims: Int, outputDims: Int, numExperts: Int, bias: Bool = true) {
         self.inputDims = inputDims
@@ -281,25 +290,68 @@ public class SwitchLinear: Module, Quantizable {
 }
 
 public class QuantizedSwitchLinear: SwitchLinear, Quantized {
-    @ModuleInfo(key: "scales") var scales: MLXArray
-    @ModuleInfo(key: "biases") var biases: MLXArray?
+    @ModuleInfo(key: "scales") public var scales: MLXArray
+    @ModuleInfo(key: "biases") public var biases: MLXArray?
+    @ModuleInfo(key: "global_scale") public var globalScale: MLXArray?
 
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
 
     public init(
-        _ other: SwitchLinear, groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine
+        inputDims: Int,
+        outputDims: Int,
+        numExperts: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray? = nil,
+        globalScale: MLXArray? = nil,
+        bias: MLXArray? = nil,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
+        self._globalScale.wrappedValue = globalScale
+        super.init(
+            inputDims: inputDims, outputDims: outputDims, numExperts: numExperts,
+            weight: weight, bias: bias)
+        self.freeze()
+    }
+
+    public init(
+        _ other: SwitchLinear,
+        groupSize: Int = 64,
+        bits: Int = 4,
+        mode: QuantizationMode = .affine,
+        useGlobalScale: Bool = false
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
 
+        var sourceWeight = other.weight
+        var computedGlobalScale: MLXArray? = nil
+        if useGlobalScale && mode == .nvfp4 {
+            let amax = maximum(
+                abs(other.weight.asType(.float32)).max(axes: [-2, -1]),
+                MLXArray(Float(1e-12))
+            )
+            let invScaleEnc = (amax * Float(1.0 / 2688.0)).expandedDimensions(axes: [-2, -1])
+            sourceWeight = (other.weight.asType(.float32) / invScaleEnc).asType(other.weight.dtype)
+            computedGlobalScale = amax
+        }
+
         let (quantizedWeight, scales, biases) = MLX.quantized(
-            other.weight, groupSize: groupSize, bits: bits, mode: mode)
+            sourceWeight, groupSize: groupSize, bits: bits, mode: mode)
 
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
+        self._globalScale.wrappedValue = computedGlobalScale
 
         super.init(
             inputDims: other.inputDims, outputDims: other.outputDims, numExperts: other.numExperts,
@@ -311,8 +363,14 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     override public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
+        let origDType = x.dtype
+        // Promote FP16 inputs to BF16 when NVFP4 global_scale is active so unscaled
+        // E4M3*E2M1 products (<= 2688) cannot overflow FP16 (65504) before post-scaling,
+        // while keeping BF16 inputs on the hardware NAX fast path.
+        let computeX =
+            (self.globalScale != nil && origDType == .float16) ? x.asType(.bfloat16) : x
         var result = MLX.gatherQuantizedMM(
-            x,
+            computeX,
             self.weight,
             scales: self.scales,
             biases: self.biases,
@@ -323,6 +381,13 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             mode: mode,
             sortedIndices: sortedIndices
         )
+
+        if let globalScale = self.globalScale {
+            result = compiledApplyNVFP4GlobalScale(result, globalScale[indices])
+            if origDType == .float16 {
+                result = result.asType(.float16)
+            }
+        }
 
         if let bias = self.bias {
             result = result + MLX.expandedDimensions(bias[indices], axis: -2)

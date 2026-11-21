@@ -49,6 +49,14 @@ public macro hubDownloader() -> MLXLMCommon.Downloader =
 public macro adaptHuggingFaceTokenizer(_ upstream: Any) -> MLXLMCommon.Tokenizer =
     #externalMacro(module: "MLXHuggingFaceMacros", type: "TokenizerAdaptorMacro")
 
+/// Wrap a `Tokenizers.Tokenizer` in `Tokenizer` with an optional sanitized chat template override.
+@freestanding(expression)
+public macro adaptHuggingFaceTokenizer(
+    _ upstream: Any,
+    chatTemplateOverride: String?
+) -> MLXLMCommon.Tokenizer =
+    #externalMacro(module: "MLXHuggingFaceMacros", type: "TokenizerAdaptorMacro")
+
 /// Provide a `TokenizerLoader` from `Tokenizers.AutoTokenizer`.
 ///
 /// ```swift
