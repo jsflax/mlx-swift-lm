@@ -1487,9 +1487,6 @@ public class CacheList: BaseKVCache {
         return result
     }
 
-    /// Internal accessor for child caches (used by serialization)
-    internal var children: [KVCache] { caches }
-
     // MARK: - Serialization
 
     /// metaState format: [childCount, (className, stateCount, metaStateCount, ...metaState)*]
