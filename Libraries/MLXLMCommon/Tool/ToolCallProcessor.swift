@@ -29,7 +29,9 @@ public class ToolCallProcessor {
     private let parser: any ToolCallParser
     private let tools: [[String: any Sendable]]?
     private let supportsBareJSONFallback: Bool
+    private let isInkling2Format: Bool
     private let maxJSONFallbackBufferLength = 32_768
+    private let maxInklingHeaderLength = 128
     private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
     private var state = State.normal
     private var toolCallBuffer = ""
@@ -62,6 +64,7 @@ public class ToolCallProcessor {
         self.parser = format.createParser()
         self.tools = tools
         self.supportsBareJSONFallback = format == .json
+        self.isInkling2Format = format == .inkling2
     }
 
     // MARK: - Computed Properties
@@ -82,6 +85,9 @@ public class ToolCallProcessor {
     /// - Parameter chunk: The text chunk to process
     /// - Returns: Regular text that should be displayed (non-tool call content), or `nil` if buffering
     public func processChunk(_ chunk: String) -> String? {
+        if isInkling2Format {
+            return processInkling2Chunk(chunk)
+        }
         if isInlineFormat {
             return processInlineChunk(chunk)
         }
@@ -143,6 +149,142 @@ public class ToolCallProcessor {
     }
 
     // MARK: - Private Methods
+
+    /// Process chunk for Inkling 2 envelope format:
+    /// `<|message_model|><fn_name><|content_invoke_tool_json|>{"name":"<fn_name>","args":{...}}<|end_message|>`
+    ///
+    /// Holds `<|message_model|><fn_name>` briefly until `<|content_invoke_tool_json|>` vs
+    /// `<|content_thinking|>` / `<|content_text|>` disambiguates so `<fn_name>` never leaks
+    /// into visible streamed text, with zero token delay on non-tool envelopes.
+    private func processInkling2Chunk(_ chunk: String) -> String? {
+        guard !chunk.isEmpty else { return nil }
+
+        switch state {
+        case .normal:
+            guard let ltIdx = chunk.firstIndex(of: "<") else {
+                return chunk
+            }
+            let leading = ltIdx > chunk.startIndex ? String(chunk[..<ltIdx]) : nil
+            toolCallBuffer = String(chunk[ltIdx...])
+            state = .potentialToolCall
+            return evaluateInkling2Potential(leadingToken: leading)
+
+        case .potentialToolCall:
+            toolCallBuffer += chunk
+            return evaluateInkling2Potential(leadingToken: nil)
+
+        case .collectingToolCall, .collectingJSONToolCall:
+            toolCallBuffer += chunk
+            return evaluateInkling2Collecting(leadingToken: nil)
+        }
+    }
+
+    private func evaluateInkling2Potential(leadingToken: String?) -> String? {
+        let msgTag = Inkling2ToolCallParser.messageModelTag
+        let invokeTag = Inkling2ToolCallParser.invokeTag
+
+        if toolCallBuffer.hasPrefix(invokeTag) {
+            state = .collectingToolCall
+            return evaluateInkling2Collecting(leadingToken: leadingToken)
+        }
+        if invokeTag.hasPrefix(toolCallBuffer) {
+            return leadingToken
+        }
+        if msgTag.hasPrefix(toolCallBuffer) && toolCallBuffer.count < msgTag.count {
+            return leadingToken
+        }
+        if toolCallBuffer.hasPrefix(msgTag) {
+            let afterMsg = toolCallBuffer.dropFirst(msgTag.count)
+            if afterMsg.isEmpty {
+                return leadingToken
+            }
+            if afterMsg.first == "<" {
+                if afterMsg.hasPrefix(invokeTag) {
+                    state = .collectingToolCall
+                    return evaluateInkling2Collecting(leadingToken: leadingToken)
+                }
+                if invokeTag.hasPrefix(afterMsg) {
+                    return leadingToken
+                }
+                let rest = String(afterMsg)
+                state = .normal
+                toolCallBuffer = ""
+                return combine(
+                    leadingToken,
+                    combine(msgTag, rest.isEmpty ? nil : processInkling2Chunk(rest))
+                )
+            }
+
+            if let ltIdx = afterMsg.firstIndex(of: "<") {
+                let fnCandidate = afterMsg[..<ltIdx]
+                let tagTail = afterMsg[ltIdx...]
+                let validName =
+                    fnCandidate.count <= maxInklingHeaderLength
+                    && !fnCandidate.contains(where: { $0.isWhitespace })
+                if validName {
+                    if tagTail.hasPrefix(invokeTag) {
+                        state = .collectingToolCall
+                        return evaluateInkling2Collecting(leadingToken: leadingToken)
+                    }
+                    if invokeTag.hasPrefix(tagTail) {
+                        return leadingToken
+                    }
+                }
+                let flushed = msgTag + String(fnCandidate)
+                let rest = String(tagTail)
+                state = .normal
+                toolCallBuffer = ""
+                return combine(
+                    leadingToken,
+                    combine(flushed, rest.isEmpty ? nil : processInkling2Chunk(rest))
+                )
+            }
+
+            if afterMsg.count > maxInklingHeaderLength
+                || afterMsg.contains(where: { $0.isWhitespace })
+            {
+                let rest = String(afterMsg)
+                state = .normal
+                toolCallBuffer = ""
+                return combine(
+                    leadingToken,
+                    combine(msgTag, rest.isEmpty ? nil : processInkling2Chunk(rest))
+                )
+            }
+
+            return leadingToken
+        }
+
+        let firstChar = String(toolCallBuffer.prefix(1))
+        let rest = String(toolCallBuffer.dropFirst())
+        state = .normal
+        toolCallBuffer = ""
+        return combine(
+            leadingToken,
+            combine(firstChar, rest.isEmpty ? nil : processInkling2Chunk(rest))
+        )
+    }
+
+    private func evaluateInkling2Collecting(leadingToken: String?) -> String? {
+        let endTag = Inkling2ToolCallParser.endMessageTag
+        guard let range = toolCallBuffer.range(of: endTag) else {
+            return leadingToken
+        }
+
+        let completeSegment = String(toolCallBuffer[..<range.upperBound])
+        let trailing = String(toolCallBuffer[range.upperBound...])
+        state = .normal
+        toolCallBuffer = ""
+
+        if let toolCall = parser.parse(content: completeSegment, tools: tools) {
+            toolCalls.append(toolCall)
+            let trailingOut = trailing.isEmpty ? nil : processInkling2Chunk(trailing)
+            return combine(leadingToken, trailingOut)
+        }
+
+        let trailingOut = trailing.isEmpty ? nil : processInkling2Chunk(trailing)
+        return combine(leadingToken, combine(completeSegment, trailingOut))
+    }
 
     /// Process chunk for inline formats (no wrapper tags).
     ///

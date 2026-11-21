@@ -33,6 +33,9 @@ public func loadWeights(
         at: modelDirectory, includingPropertiesForKeys: nil)!
     for case let url as URL in enumerator {
         if url.pathExtension == "safetensors" {
+            if !(model is any MTPDrafterModel) && url.lastPathComponent == "mtp.safetensors" {
+                continue
+            }
             let (w, m) = try loadArraysAndMetadata(url: url)
             for (key, value) in w {
                 weights[key] = value

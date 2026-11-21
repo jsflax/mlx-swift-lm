@@ -6,10 +6,20 @@ import MLX
 /// This is a lower bound on distinct live backing bytes, not allocator capacity
 /// or reclaimable memory. No tensor contents or addresses leave this operation.
 public enum KVCacheResidency {
+    private static func isResidencyMeasurable(_ cache: KVCache) -> Bool {
+        if cache is KVCacheSimple || cache is RotatingKVCache || cache is ArraysCache {
+            return true
+        }
+        if let list = cache as? CacheList {
+            return list.children.allSatisfy(isResidencyMeasurable)
+        }
+        return false
+    }
+
     public static func residentBytes(in cache: [KVCache]) -> UInt64? {
         // These layouts expose all relevant arrays without creating cache views.
         guard cache.count <= 4096,
-              cache.allSatisfy({ $0 is KVCacheSimple || $0 is ArraysCache }) else { return nil }
+              cache.allSatisfy(isResidencyMeasurable) else { return nil }
         let arrays = cache.flatMap { $0.innerState() }
         guard arrays.count <= 8192 else { return nil }
         // A completed forward can leave lazily computed state. Materialize it

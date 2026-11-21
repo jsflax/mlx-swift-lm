@@ -72,6 +72,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
         guard let argument = node.arguments.first?.expression else {
             throw MacroExpansionError.message("#adaptHuggingFaceTokenizer requires an argument")
         }
+        let overrideArgument =
+            node.arguments.dropFirst().first?.expression.description ?? "nil"
 
         return
             """
@@ -79,12 +81,14 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             //
             // import Tokenizers
             //
-            { (huggingFaceTokenizer: Tokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
+            { (huggingFaceTokenizer: any Tokenizers.Tokenizer, chatTemplateOverride: String?) -> MLXLMCommon.Tokenizer in
                 struct TokenizerBridge: MLXLMCommon.Tokenizer {
                     private let upstream: any Tokenizers.Tokenizer
+                    private let chatTemplateOverride: String?
 
-                    init(_ upstream: any Tokenizers.Tokenizer) {
+                    init(_ upstream: any Tokenizers.Tokenizer, chatTemplateOverride: String?) {
                         self.upstream = upstream
+                        self.chatTemplateOverride = chatTemplateOverride
                     }
 
                     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
@@ -114,6 +118,16 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         additionalContext: [String: any Sendable]?
                     ) throws -> [Int] {
                         do {
+                            if let chatTemplateOverride {
+                                return try upstream.applyChatTemplate(
+                                    messages: messages,
+                                    chatTemplate: .literal(chatTemplateOverride),
+                                    addGenerationPrompt: true,
+                                    truncation: false,
+                                    maxLength: nil,
+                                    tools: tools,
+                                    additionalContext: additionalContext)
+                            }
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: tools, additionalContext: additionalContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
@@ -122,8 +136,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                     }
                 }
 
-                return TokenizerBridge(huggingFaceTokenizer)
-            }(\(argument))
+                return TokenizerBridge(huggingFaceTokenizer, chatTemplateOverride: chatTemplateOverride)
+            }(\(argument), \(raw: overrideArgument))
             """
     }
 }
@@ -145,7 +159,8 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                         // import Tokenizers
                         //
                         let upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
-                        return #adaptHuggingFaceTokenizer(upstream)
+                        let override = MLXLMCommon.ChatTemplateSanitizer.loadOverrideIfNeeded(from: directory)
+                        return #adaptHuggingFaceTokenizer(upstream, chatTemplateOverride: override)
                     }
                 }
 

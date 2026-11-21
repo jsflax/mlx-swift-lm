@@ -503,7 +503,17 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
+    /// Current ring-buffer write cursor used to unrotate single-token decode key positions.
+    public var rotationIndex: Int { idx }
+
     public override var maxSize: Int? { maxCacheSize }
+
+    /// Pipeline-parallel send tie: make this cache's `keys` depend on `token`.
+    public func tieKeys(dependingOn token: MLXArray) {
+        if let keys = self.keys {
+            self.keys = depends(input: keys, dependencies: [token])
+        }
+    }
 
     public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
         self.maxCacheSize = maxSize
@@ -1389,6 +1399,16 @@ public class MambaCache: ArraysCache {
 /// Composite cache that manages multiple sub-caches
 public class CacheList: BaseKVCache {
     private var caches: [KVCache]
+
+    /// Direct child caches contained in this composite cache.
+    public var children: [KVCache] {
+        caches
+    }
+
+    public override var offset: Int {
+        get { caches.first?.offset ?? super.offset }
+        set { super.offset = newValue }
+    }
 
     public init(_ caches: KVCache...) {
         self.caches = caches
