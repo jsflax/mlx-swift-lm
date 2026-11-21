@@ -606,6 +606,15 @@ public struct Inkling2ProcessorConfiguration: Codable, Sendable {
             try c.decodeIfPresent(String.self, forKey: .imageToken)
             ?? "<|unused_200054|>"
     }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(SizeSpec(height: patchHeight, width: patchWidth), forKey: .size)
+        try c.encode(imageMean, forKey: .imageMean)
+        try c.encode(imageStd, forKey: .imageStd)
+        try c.encode(rescaleFactor, forKey: .rescaleFactor)
+        try c.encode(imageToken, forKey: .imageToken)
+    }
 }
 
 private let inkling2CIContext = CIContext(options: [.cacheIntermediates: false])
