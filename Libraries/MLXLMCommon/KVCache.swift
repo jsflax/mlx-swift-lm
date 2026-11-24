@@ -740,6 +740,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// window and do not participate in requested-capacity validation.
     package var capacityOrigin = CapacityOrigin.modelNative
 
+    /// Opts staged speculative commits (`RotatingStagedKVCache`) into `O(retaining)` in-place
+    /// ring slice updates and overwrite-only restore points rather than multi-token `updateConcat`.
+    package var prefersInPlaceRingCommit = false
+
     package var preservedPrefixTokens: Int { keep }
 
     public override var maxSize: Int? { maxCacheSize }
@@ -979,6 +983,102 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return result
     }
 
+    package struct RingOverwriteRecord {
+        let slices: [(range: Range<Int>, keys: MLXArray, values: MLXArray)]
+        let offset: Int
+        let idx: Int
+        let wrapped: Bool
+    }
+
+    /// Captures only the `count` ring slots that ``appendStagedInPlace(keys:values:)`` will
+    /// overwrite when the ring buffer is already at `storageCapacity`. Realizing the small
+    /// backup slices immediately releases their lazy graph edges to `self.keys` / `self.values`
+    /// so the live ring buffers keep a reference count of `1` during commit and donate their
+    /// backing storage to MLX's in-place `slice_update`.
+    package func captureRingOverwriteRecord(count: Int) -> RingOverwriteRecord? {
+        let ringWidth = storageCapacity - keep
+        guard count > 0, count <= ringWidth,
+            let keys = self.keys, let values = self.values,
+            keys.dim(2) == storageCapacity, values.dim(2) == storageCapacity
+        else {
+            return nil
+        }
+        let preWrapped = wrapped
+        let start = idx == storageCapacity ? keep : idx
+        let firstCount = Swift.min(count, storageCapacity - start)
+        var slices: [(range: Range<Int>, keys: MLXArray, values: MLXArray)] = []
+        slices.reserveCapacity(2)
+        let firstRange = start ..< (start + firstCount)
+        slices.append(
+            (
+                range: firstRange,
+                keys: contiguous(keys[.ellipsis, firstRange, 0...]),
+                values: contiguous(values[.ellipsis, firstRange, 0...])
+            ))
+        let secondCount = count - firstCount
+        if secondCount > 0 {
+            let secondRange = keep ..< (keep + secondCount)
+            slices.append(
+                (
+                    range: secondRange,
+                    keys: contiguous(keys[.ellipsis, secondRange, 0...]),
+                    values: contiguous(values[.ellipsis, secondRange, 0...])
+                ))
+        }
+        eval(slices.flatMap { [$0.keys, $0.values] })
+        return RingOverwriteRecord(
+            slices: slices, offset: offset, idx: idx, wrapped: preWrapped)
+    }
+
+    package func restoreRingOverwrite(_ record: RingOverwriteRecord) {
+        guard self.keys != nil, self.values != nil else { return }
+        for slice in record.slices {
+            self.keys![.ellipsis, slice.range, 0...] = slice.keys
+            self.values![.ellipsis, slice.range, 0...] = slice.values
+        }
+        offset = record.offset
+        idx = record.idx
+        wrappedFlag = record.wrapped
+    }
+
+    /// Appends committed speculative positions in place into the ring buffer in `O(count)`
+    /// without linearizing `temporalOrder` or reallocating `storageCapacity - 1 + count` rows.
+    package func appendStagedInPlace(keys: MLXArray, values: MLXArray) {
+        let count = keys.dim(2)
+        guard count > 0 else { return }
+        let ringWidth = storageCapacity - keep
+        guard ringWidth > 0, count <= ringWidth else {
+            _ = update(keys: keys, values: values)
+            return
+        }
+        wrappedFlag = wrapped
+
+        if let currentKeys = self.keys, currentKeys.dim(2) == storageCapacity {
+            var pos = 0
+            while pos < count {
+                if idx == storageCapacity {
+                    idx = keep
+                    wrappedFlag = true
+                }
+                let chunk = Swift.min(count - pos, storageCapacity - idx)
+                let dst = idx ..< (idx + chunk)
+                let src = pos ..< (pos + chunk)
+                self.keys![.ellipsis, dst, 0...] = keys[.ellipsis, src, 0...]
+                self.values![.ellipsis, dst, 0...] = values[.ellipsis, src, 0...]
+                offset += chunk
+                idx += chunk
+                pos += chunk
+            }
+            return
+        }
+
+        for pos in 0 ..< count {
+            _ = updateInPlace(
+                keys: keys[.ellipsis, pos ..< (pos + 1), 0...],
+                values: values[.ellipsis, pos ..< (pos + 1), 0...])
+        }
+    }
+
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
@@ -1190,6 +1290,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override func copy() -> any KVCache {
         let new = RotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
+        new.prefersInPlaceRingCommit = prefersInPlaceRingCommit
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }

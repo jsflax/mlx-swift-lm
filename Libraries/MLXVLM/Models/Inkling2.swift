@@ -1870,9 +1870,9 @@ public final class Inkling2: Module, VLMModel, KVCacheDimensionProvider {
         let text = config.textConfiguration
         _languageModel.wrappedValue = Inkling2TextModel(text)
         _lmHead.wrappedValue = Linear(text.hiddenSize, text.vocabularySize, bias: false)
-        if let vision = config.visionConfiguration {
-            _visionTower.wrappedValue = Inkling2VisionModel(
-                vision, textHiddenSize: text.hiddenSize)
+        if config.visionConfiguration != nil {
+            // Leave `visionTower` unconstructed until `prepareComponents` attaches it for
+            // `.immediate` loading or `onDemandVision.load()` materializes it on first image use.
             onDemandVision = OnDemandComponent(.vision) { Inkling2Vision(config) }
         } else {
             onDemandVision = nil
@@ -1891,6 +1891,9 @@ public final class Inkling2: Module, VLMModel, KVCacheDimensionProvider {
                 ? try makeSlidingWindowKVCache(parameters: parameters, window: text.slidingWindow)
                 : try makeAttentionKVCache(parameters: parameters) as? RotatingKVCache
                     ?? DirectAttentionKVCache()
+            if let rotating = attention as? RotatingKVCache {
+                rotating.prefersInPlaceRingCommit = true
+            }
             return CacheList(
                 attention,
                 ConvolutionStatesCache(slots: 4, stateLength: text.convolutionKernelSize - 1))

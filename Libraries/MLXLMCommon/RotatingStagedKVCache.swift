@@ -57,8 +57,8 @@ final class RotatingStagedKVCache: KVCache {
         live.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
     }
 
-    /// Append the first `retaining` staged positions to the ring through the normal write path and
-    /// drop the rest. The ring is untouched until this point.
+    /// Append the first `retaining` staged positions to the ring and drop the rest.
+    /// The ring is untouched until this point.
     func commit(retaining: Int) {
         defer {
             stagedKeys = nil
@@ -67,9 +67,15 @@ final class RotatingStagedKVCache: KVCache {
         guard let stagedKeys, let stagedValues else { return }
         let keep = Swift.min(Swift.max(retaining, 0), stagedKeys.dim(2))
         guard keep > 0 else { return }
-        _ = live.update(
-            keys: stagedKeys[.ellipsis, ..<keep, 0...],
-            values: stagedValues[.ellipsis, ..<keep, 0...])
+        if live.prefersInPlaceRingCommit {
+            live.appendStagedInPlace(
+                keys: stagedKeys[.ellipsis, ..<keep, 0...],
+                values: stagedValues[.ellipsis, ..<keep, 0...])
+        } else {
+            _ = live.update(
+                keys: stagedKeys[.ellipsis, ..<keep, 0...],
+                values: stagedValues[.ellipsis, ..<keep, 0...])
+        }
     }
 
     private func presentation(

@@ -168,6 +168,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     public private(set) var acceptedCount: Int = 0
     public private(set) var proposedCount: Int = 0
 
+    // Rolling window state for `drafter.minimumRollingAcceptanceRate` adaptive MoE throttling.
+    private var rollingRounds: [(proposed: Int, accepted: Int)] = []
+    private var rollingProposed = 0
+    private var rollingAccepted = 0
+    private var adaptiveSingleTokenCooldown = 0
+    private var adaptiveProbingRecovery = false
+    private static let adaptiveCooldownStride = 8
+    private static let adaptiveMaxRollingRounds = 8
+
     // Reason recorded the first time sticky-passthrough engaged, or nil if
     // the iterator stayed speculative for the full stream. Surfaced through
     // ``MTPStatsCollecting`` so `generateLoopTask` can include it on the
@@ -538,12 +547,52 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // A speculative round can emit up to `numDraft + 1` tokens: the
         // accepted draft prefix plus the verifier's correction/bonus token.
         // Keep the whole pending buffer within the remaining output budget.
+        var maxDraftWidth = blockSize - 1
+        var isRecoveryProbe = false
+        if let acceptanceFloor = drafter.minimumRollingAcceptanceRate {
+            let minSamples = Swift.max(1, drafter.minimumRollingAcceptanceSampleCount)
+            if adaptiveSingleTokenCooldown > 0 {
+                adaptiveSingleTokenCooldown -= 1
+                if adaptiveSingleTokenCooldown == 0 {
+                    adaptiveProbingRecovery = true
+                }
+                if let step = passthroughStep(maintainingDrafterState: true) {
+                    pendingTokens.append(step.token)
+                    if let logProbabilities = step.logProbabilities {
+                        pendingLogProbabilities.append(logProbabilities)
+                    }
+                }
+                return
+            }
+            if rollingProposed >= minSamples,
+                Double(rollingAccepted) / Double(rollingProposed) < acceptanceFloor
+            {
+                if adaptiveProbingRecovery {
+                    adaptiveProbingRecovery = false
+                    maxDraftWidth = 1
+                    isRecoveryProbe = true
+                } else {
+                    adaptiveSingleTokenCooldown = Self.adaptiveCooldownStride - 1
+                    if adaptiveSingleTokenCooldown == 0 {
+                        adaptiveProbingRecovery = true
+                    }
+                    if let step = passthroughStep(maintainingDrafterState: true) {
+                        pendingTokens.append(step.token)
+                        if let logProbabilities = step.logProbabilities {
+                            pendingLogProbabilities.append(logProbabilities)
+                        }
+                    }
+                    return
+                }
+            }
+        }
+
         let numDraft: Int
         if let maxTokens {
             let remaining = maxTokens - tokenCount
             guard remaining > 0 else { return }
 
-            let draftBudget = Swift.min(remaining - 1, blockSize - 1)
+            let draftBudget = Swift.min(remaining - 1, maxDraftWidth)
             guard draftBudget > 0 else {
                 if let step = passthroughStep(maintainingDrafterState: true) {
                     pendingTokens.append(step.token)
@@ -555,7 +604,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             }
             numDraft = draftBudget
         } else {
-            numDraft = blockSize - 1
+            numDraft = maxDraftWidth
         }
 
         guard let state = mainState,
@@ -729,6 +778,26 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         proposedCount += numDraft
         acceptedCount += accepted
+        if drafter.minimumRollingAcceptanceRate != nil {
+            if isRecoveryProbe, accepted == numDraft {
+                rollingRounds = [(proposed: numDraft, accepted: accepted)]
+                rollingProposed = numDraft
+                rollingAccepted = accepted
+            } else {
+                rollingRounds.append((proposed: numDraft, accepted: accepted))
+                rollingProposed += numDraft
+                rollingAccepted += accepted
+                let minSamples = Swift.max(1, drafter.minimumRollingAcceptanceSampleCount)
+                while rollingRounds.count > Self.adaptiveMaxRollingRounds,
+                    let oldest = rollingRounds.first,
+                    rollingProposed - oldest.proposed >= minSamples
+                {
+                    rollingRounds.removeFirst()
+                    rollingProposed -= oldest.proposed
+                    rollingAccepted -= oldest.accepted
+                }
+            }
+        }
         lastRoundAccepted = accepted
         if let verifyHidden = mainResult.state?[mtpLastHiddenStatesKey] {
             lastVerifyHidden = verifyHidden
@@ -839,10 +908,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         if maintainingDrafterState {
             stepState = stepState ?? LMOutput.State()
             stepState?[mtpEmitFlagKey] = true
+            stepState?[mtpTargetLayerIdsKey] = drafter.targetLayerIds
         }
         let result = mainModel(y[text: .newAxis], cache: mainCache, state: stepState)
         mainState = result.state
         mainCacheStorage.commitProcessedTokens(y.cacheSequenceLength)
+        if maintainingDrafterState {
+            lastRoundAccepted = nil
+            if !reconcileSharedKVState(
+                &mainState, discarding: 0,
+                lengths: mainCacheStorage.emittedLength(forLeaf:))
+            {
+                switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
+                mainState = nil
+            }
+        }
         var logits = result.logits[0..., -1, 0...]
         logits = processor?.process(logits: logits) ?? logits
         let token = sampler.sample(logits: logits)

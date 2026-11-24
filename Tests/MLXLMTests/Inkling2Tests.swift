@@ -690,9 +690,105 @@ struct Inkling2ModelTests {
         #expect(a.logits.shape == [1, 1, 48])
         #expect(maxDifference(a.logits, b.logits) < 1e-2)
     }
+
+    @Test("Vision tower stays unconstructed at init and loads only on demand or immediate policy")
+    func lazyVisionTowerStaysUnallocatedUntilNeeded() throws {
+        let visionJSON = Self.tinyJSON.replacingOccurrences(
+            of: "\"model_type\": \"inkling2_loop\",",
+            with: """
+                "model_type": "inkling2_loop",
+                "vision_config": {
+                  "native_patch_size": 4, "adapter_merge_size": 2, "projection_hidden_dim": 64,
+                  "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4
+                },
+                """)
+        let config = try JSONDecoder().decode(
+            Inkling2Configuration.self, from: Data(visionJSON.utf8))
+        let coldModel = Inkling2(config)
+        #expect(!coldModel.parameters().flattened().contains { $0.0.hasPrefix("vision_tower.") })
+        #expect(coldModel.onDemandComponents.count == 1)
+
+        // Build a synthetic checkpoint containing both text and vision tensors via `.immediate` tree.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Inkling2LazyVisionTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let templateModel = Inkling2(config)
+        let dummyURL = directory.appendingPathComponent("model.safetensors")
+        _ = try prepareComponents(
+            of: templateModel, urls: [dummyURL], excluded: [], loading: .immediate,
+            perLayerQuantization: nil)
+        #expect(templateModel.parameters().flattened().contains { $0.0.hasPrefix("vision_tower.") })
+
+        var weights = [String: MLXArray]()
+        for (key, value) in templateModel.parameters().flattened() {
+            if key.hasSuffix("_proj.weight") && value.dtype == .uint32 {
+                let prefix = String(key.dropLast(".weight".count))
+                let dense = MLXArray.zeros([value.dim(0), value.dim(1), value.dim(2) * 8])
+                let (w, s, _) = MLX.quantized(dense, groupSize: 16, bits: 4, mode: .nvfp4)
+                weights[key] = w
+                weights["\(prefix).scales"] = s
+            } else if key.hasSuffix(".global_scale") {
+                weights[key] = MLXArray.ones(value.shape)
+            } else {
+                weights[key] = MLXArray.zeros(value.shape, dtype: value.dtype)
+            }
+        }
+        try save(arrays: weights, url: dummyURL)
+
+        let textOnlyLoaded = Inkling2(config)
+        try loadWeights(
+            modelDirectory: directory, model: textOnlyLoaded, componentLoading: .onFirstUse)
+        #expect(
+            !textOnlyLoaded.parameters().flattened().contains { $0.0.hasPrefix("vision_tower.") })
+
+        let immediateLoaded = Inkling2(config)
+        try loadWeights(
+            modelDirectory: directory, model: immediateLoaded, componentLoading: .immediate)
+        #expect(
+            immediateLoaded.parameters().flattened().contains { $0.0.hasPrefix("vision_tower.") })
+    }
 }
 
 // MARK: - Speculative decoding
+
+/// Proposes low-acceptance drafts during an initial phase and exact greedy drafts afterward so
+/// `minimumRollingAcceptanceRate` step-down and recovery can be verified deterministically.
+private final class PhasedAcceptanceDrafter: Module, MTPDrafterModel {
+    let continuation: [Int]
+    let promptLength: Int
+    let recoveryTokenOffset: Int
+    let requiresSharedTargetKV = false
+    let requiresGreedySampling = true
+    let minimumRollingAcceptanceRate: Double? = 0.36
+    let minimumRollingAcceptanceSampleCount: Int = 15
+
+    init(continuation: [Int], promptLength: Int, recoveryTokenOffset: Int) {
+        self.continuation = continuation
+        self.promptLength = promptLength
+        self.recoveryTokenOffset = recoveryTokenOffset
+    }
+
+    func validateCompatibility(with _: any LanguageModel) throws {}
+
+    func draftBlock(
+        target _: any LanguageModel, lastToken _: MLXArray, lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,
+        queryOffset: Int, blockSize: Int, sampler _: any LogitSampler
+    ) -> MLXArray {
+        let genPos = queryOffset - promptLength
+        let drafts = (1 ..< blockSize).map { step -> Int32 in
+            let index = min(genPos + step, continuation.count - 1)
+            let token = continuation[index]
+            if genPos < recoveryTokenOffset {
+                return Int32((token + 1) % 48)
+            }
+            return Int32(token)
+        }
+        return MLXArray(drafts).reshaped(1, -1)
+    }
+}
 
 /// Proposes the target's greedy continuation, wrong at every third draft, so rounds accept some
 /// drafts and reject the rest.
@@ -825,6 +921,145 @@ struct Inkling2SpeculativeDecodingTests {
         let actual = matmul(latent, folded.asType(.float32).T) + foldedBias.asType(.float32)
         #expect(maxDifference(actual, expected) < 5e-2)
         #expect(checkpoint.weights["lm_head.weight"] == nil, "the head stays the target's")
+    }
+
+    @Test("Post-wrap sliding-window commits mutate the ring in place without growing past window")
+    func postWrapSlidingWindowCommitStaysAtWindowCapacity() throws {
+        let model = try Inkling2ModelTests.makeModel()
+        let expected = try Self.greedy(model, prompt: Self.prompt, count: 28)
+        let drafter = ScriptedDrafter(continuation: expected, promptLength: 5)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: Self.prompt, mainModel: model, drafter: drafter,
+            parameters: .init(maxTokens: 28, temperature: 0), blockSize: 4)
+        let output = Array(AnyIterator { iterator.next() })
+        #expect(output == expected)
+
+        // Every sliding-window RotatingKVCache leaf (window = 8) must stay capped at exactly 8 rows
+        // instead of growing to `window - 1 + accepted` via `updateConcat`.
+        let rotatingLeaves = KVCacheTree.leaves(in: iterator.mainCache).compactMap {
+            $0.cache as? RotatingKVCache
+        }
+        #expect(!rotatingLeaves.isEmpty)
+        for rotating in rotatingLeaves {
+            for array in rotating.innerState() {
+                #expect(array.dim(2) == 8)
+            }
+        }
+
+        // Also verify `RotatingOverwriteRestorePoint` rewinds committed lookahead cleanly when
+        // generation stops inside an accepted post-wrap block (`finalizeGeneration()`).
+        let stopOffset = 17
+        var earlyIterator = try MTPSpeculativeTokenIterator(
+            input: Self.prompt, mainModel: model,
+            drafter: ScriptedDrafter(continuation: expected, promptLength: 5),
+            parameters: .init(maxTokens: 28, temperature: 0), blockSize: 4)
+        var partial = [Int]()
+        while partial.count < stopOffset, let tok = earlyIterator.next() {
+            partial.append(tok)
+        }
+        earlyIterator.finalizeGeneration()
+        #expect(partial == Array(expected.prefix(stopOffset)))
+        #expect(earlyIterator.mainCacheStorage.processedTokenCount == 5 + stopOffset - 1)
+    }
+
+    @Test(
+        "Adaptive rolling acceptance steps down on low MoE acceptance and recovers on high acceptance"
+    )
+    func adaptiveRollingAcceptanceStepsDownAndRecovers() throws {
+        let model = try Inkling2ModelTests.makeModel()
+        let totalTokens = 32
+        let expected = try Self.greedy(model, prompt: Self.prompt, count: totalTokens)
+
+        // All-rejected until token 12 (< 36% after 15 proposed drafts -> enters 8-token single-step
+        // stride), then 100% accepted from token 12 onward (-> 1-draft probe succeeds and resumes
+        // full 3-draft blocks).
+        let drafter = PhasedAcceptanceDrafter(
+            continuation: expected, promptLength: 5, recoveryTokenOffset: 12)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: Self.prompt, mainModel: model, drafter: drafter,
+            parameters: .init(maxTokens: totalTokens, temperature: 0), blockSize: 4)
+        let output = Array(AnyIterator { iterator.next() })
+
+        #expect(output == expected)
+        #expect(iterator.passthroughReason == nil)
+        // Without step-down, ~31 rounds * 3 = ~93 drafts would be proposed; with step-down + recovery,
+        // the middle low-acceptance stretch runs single-token steps and later recovers (> 0 accepted).
+        #expect(iterator.proposedCount < 50)
+        #expect(iterator.acceptedCount >= 6)
+    }
+
+    @Test(
+        "A 4-bit quantized mtp-4bit.safetensors companion loads and drafts without config quantization"
+    )
+    func quantized4BitCompanionLoadsAndDrafts() throws {
+        let model = try Inkling2ModelTests.makeModel()
+        let configuration = try JSONDecoder().decode(
+            Inkling2DSparkConfiguration.self, from: Data(Self.draftJSON.utf8))
+        let sourceDrafter = Inkling2DSparkDraftModel(configuration)
+        MLXRandom.seed(41)
+
+        var rawWeights = [String: MLXArray]()
+        for (key, value) in sourceDrafter.parameters().flattened() {
+            rawWeights[key] = MLXRandom.normal(value.shape) * 0.25
+        }
+        // Replace `fold` with raw `hidden_out` + target `lm_head`, then 4-bit quantize every
+        // eligible draft Linear/Embedding (including `rnn_proj` and `hidden_out`) into `mtp-4bit.safetensors`.
+        rawWeights.removeValue(forKey: "markov_head.fold.weight")
+        rawWeights.removeValue(forKey: "markov_head.fold.bias")
+        let hiddenOutW = MLXRandom.normal([64, 32]) * 0.25
+        let hiddenOutB = MLXRandom.normal([64]) * 0.1
+        let targetHeadW = try #require(
+            Dictionary(uniqueKeysWithValues: model.parameters().flattened())["lm_head.weight"])
+
+        // Configure `markov_rank = 32` so groupSize = 32 divides `hidden_out` & `markov_w1`.
+        let q4DraftJSON = Self.draftJSON.replacingOccurrences(
+            of: "\"markov_rank\": 8", with: "\"markov_rank\": 32")
+        let q4Config = try JSONDecoder().decode(
+            Inkling2DSparkConfiguration.self, from: Data(q4DraftJSON.utf8))
+        let q4Template = Inkling2DSparkDraftModel(q4Config)
+        var companionTensors = [String: MLXArray]()
+        for (key, value) in q4Template.parameters().flattened() {
+            guard !key.hasPrefix("markov_head.fold.") else { continue }
+            let dense = MLXRandom.normal(value.shape) * 0.25
+            if key.hasSuffix(".weight"), dense.ndim == 2, dense.dim(1).isMultiple(of: 32) {
+                let prefix = String(key.dropLast(".weight".count))
+                let (wq, sq, bq) = MLX.quantized(dense, groupSize: 32, bits: 4)
+                companionTensors[key] = wq
+                companionTensors["\(prefix).scales"] = sq
+                companionTensors["\(prefix).biases"] = bq!
+            } else {
+                companionTensors[key] = dense
+            }
+        }
+        let (hoW, hoS, hoB) = MLX.quantized(hiddenOutW, groupSize: 32, bits: 4)
+        companionTensors["markov_head.hidden_out.weight"] = hoW
+        companionTensors["markov_head.hidden_out.scales"] = hoS
+        companionTensors["markov_head.hidden_out.biases"] = hoB!
+        companionTensors["markov_head.hidden_out.bias"] = hiddenOutB
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Inkling2Q4MTPTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try save(
+            arrays: ["lm_head.weight": targetHeadW],
+            url: directory.appendingPathComponent("model.safetensors"))
+        try save(
+            arrays: companionTensors,
+            url: directory.appendingPathComponent("mtp-4bit.safetensors"))
+
+        let loadedDrafter = Inkling2DSparkDraftModel(q4Config)
+        try loadWeights(modelDirectory: directory, model: loadedDrafter)
+
+        let expected = try Self.greedy(model, prompt: Self.prompt, count: 16)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: Self.prompt, mainModel: model, drafter: loadedDrafter,
+            parameters: .init(maxTokens: 16, temperature: 0), blockSize: 4)
+        let output = Array(AnyIterator { iterator.next() })
+        #expect(output == expected)
+        #expect(iterator.passthroughReason == nil)
+        #expect(iterator.proposedCount > 0)
     }
 }
 

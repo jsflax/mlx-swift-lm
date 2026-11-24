@@ -221,6 +221,8 @@ private final class Inkling2DSparkMarkovHead: Module {
     @ModuleInfo(key: "dflare_norm") var featureNorm: RMSNorm
 
     let rank: Int
+    private var preparedRecurrence:
+        (stepWeightT: MLXArray, contextWeightT: MLXArray, bias: MLXArray)?
 
     init(_ configuration: Inkling2DSparkConfiguration) {
         let (d, r, v) = (
@@ -233,21 +235,77 @@ private final class Inkling2DSparkMarkovHead: Module {
         _featureNorm.wrappedValue = RMSNorm(dimensions: d, eps: configuration.rmsNormEps)
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let replacesRecurrence = parameters.flattened().contains { key, _ in
+            key.hasPrefix("rnn_proj.")
+        }
+        defer {
+            if replacesRecurrence {
+                preparedRecurrence = nil
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        defer {
+            if key == "rnn_proj" {
+                preparedRecurrence = nil
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    func prepareRecurrenceWeights() {
+        let resolved = computeRecurrenceWeights()
+        eval(resolved.stepWeightT, resolved.contextWeightT, resolved.bias)
+        preparedRecurrence = resolved
+    }
+
+    private func computeRecurrenceWeights() -> (
+        stepWeightT: MLXArray, contextWeightT: MLXArray, bias: MLXArray
+    ) {
+        let denseWeight: MLXArray
+        if let quantized = recurrence as? QuantizedLinear {
+            denseWeight = dequantized(
+                quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                mode: quantized.mode
+            ).asType(.float32)
+        } else {
+            denseWeight = recurrence.weight.asType(.float32)
+        }
+        let bias =
+            (recurrence.bias ?? MLXArray.zeros([3 * rank], dtype: .float32)).asType(.float32)
+        return (
+            stepWeightT: contiguous(denseWeight[0..., ..<(2 * rank)].T),
+            contextWeightT: contiguous(denseWeight[0..., (2 * rank)...].T),
+            bias: bias
+        )
+    }
+
     /// The float32 bias and `[hidden, features]` part of the recurrence, for every draft.
     func context(hidden: MLXArray, features: MLXArray) -> MLXArray {
         let inputs = concatenated(
             [hidden, broadcast(features, to: hidden.shape)], axis: -1
         ).asType(.float32)
-        let weight = recurrence.weight[0..., (2 * rank)...].asType(.float32)
-        return matmul(inputs, weight.T) + recurrence.bias!.asType(.float32)
+        let (_, contextWeightT, bias) = preparedRecurrence ?? computeRecurrenceWeights()
+        return matmul(inputs, contextWeightT) + bias
     }
 
     /// One step from the float32 `context` of a draft: the next state and the logit correction.
     func step(state: MLXArray, previous: MLXArray, context: MLXArray) -> (MLXArray, MLXArray) {
         let inputs = concatenated([state, previousToken(previous)], axis: -1).asType(.float32)
-        let raw =
-            (context + matmul(inputs, recurrence.weight[0..., ..<(2 * rank)].asType(.float32).T))
-            .asType(state.dtype)
+        let (stepWeightT, _, _) = preparedRecurrence ?? computeRecurrenceWeights()
+        let raw = (context + matmul(inputs, stepWeightT)).asType(state.dtype)
         let gate = sigmoid(raw[.ellipsis, ..<rank])
         let candidate = tanh(raw[.ellipsis, rank ..< (2 * rank)])
         let next = gate * state + (1 - gate) * candidate
@@ -257,7 +315,8 @@ private final class Inkling2DSparkMarkovHead: Module {
 
 // MARK: - Draft model
 
-/// Thinking Machines' DSpark drafter for Inkling 2, from the checkpoint's `mtp.safetensors`.
+/// Thinking Machines' DSpark drafter for Inkling 2, from the checkpoint's `mtp.safetensors`
+/// or `mtp-4bit.safetensors`.
 ///
 /// An anchor and `blockSize - 1` masks run through three dense layers that attend to K/V
 /// projected from four target features: partial blocks of three layer visits and the final hidden
@@ -272,9 +331,13 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel,
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
     public var targetLayerIds: [Int]? { configuration.targetLayerIDs }
+    /// Inkling 2's 128-expert top-8 looped MoE target fans out across ~4-5x more active experts
+    /// during multi-token verify than single-token decode (~41% break-even); step down below 36%.
+    public var minimumRollingAcceptanceRate: Double? { 0.36 }
 
-    /// The draft ships beside the target's weights, which it reads only to fold its head.
-    public var additionalWeightFiles: [String] { ["mtp.safetensors"] }
+    /// The draft ships beside the target's weights (`mtp.safetensors` or 4-bit `mtp-4bit.safetensors`),
+    /// reading the target's vocabulary head only to fold `markov_head.hidden_out`.
+    public var additionalWeightFiles: [String] { ["mtp.safetensors", "mtp-4bit.safetensors"] }
     public var excludedCheckpointNamespaces: [String] { Inkling2Checkpoint.namespacesBesideHead }
 
     @ModuleInfo fileprivate var layers: [Inkling2DSparkLayer]
@@ -429,33 +492,81 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel,
             && text.layerVisits.count == configuration.targetLayerIDs.last
     }
 
-    /// Folds `hidden_out` into the target's vocabulary head, which is read for this alone.
+    public func prepare() throws {
+        markovHead.prepareRecurrenceWeights()
+    }
+
+    /// Folds `hidden_out` into the target's vocabulary head, which is read for this alone, and
+    /// infers per-layer quantization for pre-quantized `mtp-4bit.safetensors` companions.
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
         var checkpoint = checkpoint
-        var weights = checkpoint.weights
+        var weights = [String: MLXArray](minimumCapacity: checkpoint.weights.count)
+        let hasTopLevelDraftKeys =
+            checkpoint.weights["fuse_weight"] != nil || checkpoint.weights["mask_embed"] != nil
+        for (rawKey, value) in checkpoint.weights {
+            var key = rawKey
+            if !hasTopLevelDraftKeys {
+                if key.hasPrefix("model.mtp.") {
+                    key = String(key.dropFirst("model.mtp.".count))
+                } else if key.hasPrefix("mtp.") {
+                    key = String(key.dropFirst("mtp.".count))
+                }
+            }
+            weights[key] = value
+        }
+
         guard
             let head = weights.removeValue(forKey: "lm_head.weight")
                 ?? weights.removeValue(forKey: "\(Inkling2Checkpoint.originalHead).weight"),
-            let projection = weights.removeValue(forKey: "markov_head.hidden_out.weight"),
+            let rawProjection = weights.removeValue(forKey: "markov_head.hidden_out.weight"),
             let bias = weights.removeValue(forKey: "markov_head.hidden_out.bias")
         else {
             throw ModelFactoryError.invalidConfiguration(
-                "Inkling 2 DSpark needs mtp.safetensors beside the model's vocabulary head.")
+                "Inkling 2 DSpark needs mtp.safetensors or mtp-4bit.safetensors beside the model's vocabulary head."
+            )
         }
-        let scales = weights.removeValue(forKey: "lm_head.scales")
+        let scales =
+            weights.removeValue(forKey: "lm_head.scales")
+            ?? weights.removeValue(forKey: "\(Inkling2Checkpoint.originalHead).weight_scale")
         let biases = weights.removeValue(forKey: "lm_head.biases")
-        let quantization = checkpoint.perLayerQuantization?.quantization(layer: "lm_head")
+        let headQuantization =
+            checkpoint.perLayerQuantization?.quantization(layer: "lm_head")
+            ?? scales.flatMap {
+                Self.inferAffineQuantization(
+                    packedWeight: head, scales: $0, inputDimensions: configuration.hiddenSize)
+            }
+
+        let hiddenOutScales = weights.removeValue(forKey: "markov_head.hidden_out.scales")
+        let hiddenOutBiases = weights.removeValue(forKey: "markov_head.hidden_out.biases")
+        let projection: MLXArray
+        if let hiddenOutScales {
+            let q =
+                checkpoint.perLayerQuantization?.quantization(layer: "markov_head.hidden_out")
+                ?? Self.inferAffineQuantization(
+                    packedWeight: rawProjection,
+                    scales: hiddenOutScales,
+                    inputDimensions: configuration.markovRank)
+            if let q {
+                projection = dequantized(
+                    rawProjection, scales: hiddenOutScales, biases: hiddenOutBiases,
+                    groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            } else {
+                projection = rawProjection
+            }
+        } else {
+            projection = rawProjection
+        }
 
         var foldWeights = [MLXArray]()
         var foldBiases = [MLXArray]()
         for start in stride(from: 0, to: head.dim(0), by: 16384) {
             let rows = start ..< min(start + 16384, head.dim(0))
             var chunk = head[rows]
-            if let scales, let quantization {
+            if let scales, let headQuantization {
                 chunk = dequantized(
                     chunk, scales: scales[rows], biases: biases?[rows],
-                    groupSize: quantization.groupSize, bits: quantization.bits,
-                    mode: quantization.mode)
+                    groupSize: headQuantization.groupSize, bits: headQuantization.bits,
+                    mode: headQuantization.mode)
             }
             let rowsF32 = chunk.asType(.float32)
             foldWeights.append(matmul(rowsF32, projection.asType(.float32)).asType(.bfloat16))
@@ -464,7 +575,58 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel,
         }
         weights["markov_head.fold.weight"] = concatenated(foldWeights)
         weights["markov_head.fold.bias"] = concatenated(foldBiases)
+
+        // Populate per-layer quantization entries for any pre-quantized companion tensors when
+        // the target's `config.json` has no matching quantization metadata (e.g. NVFP4/BF16 target
+        // paired with a 4-bit affine `mtp-4bit.safetensors` companion).
+        var inferredPerLayer = checkpoint.perLayerQuantization?.perLayerQuantization ?? [:]
+        var inferredAny = false
+        for (path, module) in namedModules() where !(module is any Quantized) {
+            guard let layerScales = weights["\(path).scales"],
+                let packedWeight = weights["\(path).weight"]
+            else { continue }
+            let inputDims: Int? =
+                if let linear = module as? Linear {
+                    linear.weight.dim(1)
+                } else if let embedding = module as? Embedding {
+                    embedding.weight.dim(1)
+                } else {
+                    nil
+                }
+            guard let inputDims,
+                let inferred = Self.inferAffineQuantization(
+                    packedWeight: packedWeight, scales: layerScales, inputDimensions: inputDims)
+            else { continue }
+            let existing = checkpoint.perLayerQuantization?.quantization(layer: path)
+            if existing == nil || existing?.groupSize != inferred.groupSize
+                || existing?.bits != inferred.bits
+                || (weights["\(path).biases"] != nil && existing?.mode != .affine)
+            {
+                inferredPerLayer[path] = .quantize(inferred)
+                inferredAny = true
+            }
+        }
+        if inferredAny {
+            checkpoint.perLayerQuantization = .init(
+                quantization: checkpoint.perLayerQuantization?.quantization,
+                perLayerQuantization: inferredPerLayer)
+        }
+
         checkpoint.weights = weights
         return checkpoint
+    }
+
+    private static func inferAffineQuantization(
+        packedWeight: MLXArray, scales: MLXArray, inputDimensions: Int
+    ) -> BaseConfiguration.Quantization? {
+        guard inputDimensions > 0, scales.dim(-1) > 0, packedWeight.dim(-1) > 0,
+            inputDimensions.isMultiple(of: scales.dim(-1))
+        else {
+            return nil
+        }
+        let groupSize = inputDimensions / scales.dim(-1)
+        let bits = (packedWeight.dim(-1) * 32) / inputDimensions
+        guard bits == 2 || bits == 3 || bits == 4 || bits == 6 || bits == 8 else { return nil }
+        return .init(groupSize: groupSize, bits: bits)
     }
 }

@@ -77,6 +77,23 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// taps recorded in their checkpoint configuration.
     var targetLayerIds: [Int]? { get }
 
+    /// Minimum rolling draft-acceptance ratio `[0, 1]` required to continue
+    /// full-block speculation after ``minimumRollingAcceptanceSampleCount``
+    /// proposed draft tokens, or `nil` when no floor applies.
+    ///
+    /// Sparse MoE targets with large expert fan-out (such as 128-expert top-8
+    /// looped architectures) touch substantially more expert weights during a
+    /// multi-token verify pass than during single-token decode. Opting into a
+    /// rolling floor lets ``MTPSpeculativeTokenIterator`` step down to
+    /// single-token decode strides (while keeping drafter state synchronized
+    /// and periodically re-probing recovery) whenever acceptance drops below
+    /// the target's throughput break-even.
+    var minimumRollingAcceptanceRate: Double? { get }
+
+    /// Minimum number of proposed draft tokens before
+    /// ``minimumRollingAcceptanceRate`` is evaluated.
+    var minimumRollingAcceptanceSampleCount: Int { get }
+
     /// K-step drafting from a constant position.
     ///
     /// Returns the proposed tokens as a `[B, blockSize - 1]` MLXArray. The
@@ -127,6 +144,8 @@ extension MTPDrafterModel {
     public var requiresPromptPrefill: Bool { false }
     public var requiresGreedySampling: Bool { false }
     public var targetLayerIds: [Int]? { nil }
+    public var minimumRollingAcceptanceRate: Double? { nil }
+    public var minimumRollingAcceptanceSampleCount: Int { 15 }
 }
 
 /// Target-side capability for rewinding an in-place speculative verify pass.

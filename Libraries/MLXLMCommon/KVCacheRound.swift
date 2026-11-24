@@ -135,6 +135,14 @@ final class RotatingRoundStrategy: KVCacheRoundStrategy {
         // every round of every short generation. Ask about the post-commit position, since that
         // is the state a later rewind would be undoing.
         guard !live.isTrimmable(after: retaining) else { return nil }
+        if live.prefersInPlaceRingCommit {
+            let clamped = Swift.min(Swift.max(retaining, 0), staged.stagedCount)
+            if let overwrite = live.captureRingOverwriteRecord(count: clamped) {
+                return RotatingOverwriteRestorePoint(
+                    overwrite: overwrite,
+                    replay: staged.stagedArrays)
+            }
+        }
         let snapshot = live.state
         guard snapshot.count == 2 else { return nil }
         return RotatingRestorePoint(
@@ -147,11 +155,30 @@ final class RotatingRoundStrategy: KVCacheRoundStrategy {
     }
 }
 
+/// Restores a steady-state rotating leaf in `O(retaining)` by writing back only the slots the
+/// commit overwrote, leaving the ring buffer's reference count at `1` during normal commits.
+struct RotatingOverwriteRestorePoint: KVCacheLeafRestorePoint {
+    let overwrite: RotatingKVCache.RingOverwriteRecord
+    let replay: (MLXArray, MLXArray)?
+
+    func canRestore(into leaf: KVCache) -> Bool { leaf is RotatingKVCache }
+
+    @discardableResult
+    func restore(into leaf: KVCache, retaining: Int) -> Bool {
+        guard let live = leaf as? RotatingKVCache else { return false }
+        live.restoreRingOverwrite(overwrite)
+        guard retaining > 0, let replay else { return true }
+        live.appendStagedInPlace(
+            keys: replay.0[.ellipsis, ..<retaining, 0...],
+            values: replay.1[.ellipsis, ..<retaining, 0...])
+        return true
+    }
+}
+
 /// Restores a rotating leaf by putting its ring back and replaying the accepted rows.
 ///
-/// Capture is cheap -- a full-range slice reuses the underlying node -- so the price is deferred:
-/// while the snapshot is alive the next ring write cannot donate its buffer. It is dropped as
-/// soon as another round opens.
+/// Used when the cache buffer is not yet at steady-state `storageCapacity` (for example on the
+/// first commit that compacts an oversized prefill buffer or crosses the initial wrap).
 struct RotatingRestorePoint: KVCacheLeafRestorePoint {
     let state: [MLXArray]
     let metaState: [String]
@@ -167,9 +194,15 @@ struct RotatingRestorePoint: KVCacheLeafRestorePoint {
         live.state = state
         live.metaState = metaState
         guard retaining > 0, let replay else { return true }
-        _ = live.update(
-            keys: replay.0[.ellipsis, ..<retaining, 0...],
-            values: replay.1[.ellipsis, ..<retaining, 0...])
+        if live.prefersInPlaceRingCommit {
+            live.appendStagedInPlace(
+                keys: replay.0[.ellipsis, ..<retaining, 0...],
+                values: replay.1[.ellipsis, ..<retaining, 0...])
+        } else {
+            _ = live.update(
+                keys: replay.0[.ellipsis, ..<retaining, 0...],
+                values: replay.1[.ellipsis, ..<retaining, 0...])
+        }
         return true
     }
 }
